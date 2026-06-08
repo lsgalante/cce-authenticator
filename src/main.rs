@@ -6,6 +6,10 @@ use clear_ui::widget::{
 };
 use glyphon::{Attrs, Buffer, FontSystem, Metrics};
 use futures::StreamExt;
+use std::sync::{Arc, Mutex};
+use std::io::Write;
+use tokio::sync::oneshot;
+use std::ops::Deref;
 
 const ACCENT: [f32; 4] = [0.30, 0.50, 0.32, 1.0];
 const TOGGLE_OFF: [f32; 4] = [0.16, 0.16, 0.24, 1.0];
@@ -21,6 +25,7 @@ fn make_text_buffer(fs: &mut FontSystem, text: &str, size: f32) -> Buffer {
 #[derive(Clone, Debug)]
 enum AuthResult {
     Success,
+    ExitWindow,
     Failure(String),
     FingerprintStatus(String),
 }
@@ -30,13 +35,28 @@ enum AppMessage {
     PasswordVerify,
     FingerprintScanStart,
     AuthDone(AuthResult),
+    Cancel,
+    PromptReceived(String, bool), // (prompt, echo)
+    StatusReceived(String, bool), // (message, is_error)
 }
+
+struct GuiRequest {
+    username: String,
+    message: String,
+    cookie: String,
+    tx_result: oneshot::Sender<Result<(), String>>,
+}
+
+static ACTIVE_REQUEST: Mutex<Option<GuiRequest>> = Mutex::new(None);
+static ACTIVE_SENDER: Mutex<Option<calloop::channel::Sender<AppMessage>>> = Mutex::new(None);
+static ACTIVE_COOKIE: Mutex<Option<String>> = Mutex::new(None);
 
 struct AuthenticatorApp {
     font_system: FontSystem,
     bg: ContentBg,
     password_box: TextBox,
     verify_btn: Button,
+    cancel_btn: Button,
     fingerprint_btn: Button,
     
     status_msg: String,
@@ -56,12 +76,16 @@ struct AuthenticatorApp {
     
     simulate_mode: bool,
     glow_timer: f32,
+    
+    polkit_mode: bool,
+    helper_stdin: Option<std::process::ChildStdin>,
+    shared_child: Option<Arc<Mutex<Option<std::process::Child>>>>,
 }
 
 impl Application for AuthenticatorApp {
     type Message = AppMessage;
 
-    fn new(_qh: &QueueHandle<EngineState<Self>>, _sender: calloop::channel::Sender<Self::Message>) -> Self {
+    fn new(_qh: &QueueHandle<EngineState<Self>>, sender: calloop::channel::Sender<Self::Message>) -> Self {
         let font_system = FontSystem::new();
         let bg = ContentBg::new();
         
@@ -70,21 +94,99 @@ impl Application for AuthenticatorApp {
             .with_label("PASSWORD");
             
         let verify_btn = Button::new(0.0, 0.0, 100.0, 32.0).with_label("Verify Password");
+        let cancel_btn = Button::new(0.0, 0.0, 100.0, 32.0).with_label("Cancel");
         let fingerprint_btn = Button::new(0.0, 0.0, 120.0, 120.0).with_label("Scan");
         
         let (tx_auth, rx_auth) = std::sync::mpsc::channel();
         
-        let simulate_mode = std::env::var("CCE_AUTH_SIMULATE").is_ok() || 
+        let active_req = ACTIVE_REQUEST.lock().unwrap();
+        let polkit_mode = active_req.is_some();
+        
+        let mut helper_stdin = None;
+        let mut shared_child = None;
+        let mut status_msg = "Authenticate using password or fingerprint".to_string();
+        let mut simulate_mode = std::env::var("CCE_AUTH_SIMULATE").is_ok() || 
                              std::env::var("USER").unwrap_or_default() == "root";
+        
+        if let Some(ref req) = *active_req {
+            status_msg = req.message.clone();
+            simulate_mode = false;
+            
+            // Spawn polkit-agent-helper-1
+            match std::process::Command::new("/usr/lib/polkit-1/polkit-agent-helper-1")
+                .arg(&req.username)
+                .arg(&req.cookie)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::inherit())
+                .spawn()
+            {
+                Ok(mut child) => {
+                    let stdin = child.stdin.take();
+                    let stdout = child.stdout.take();
+                    helper_stdin = stdin;
+                    
+                    let child_arc = Arc::new(Mutex::new(Some(child)));
+                    shared_child = Some(child_arc.clone());
+                    
+                    if let Some(stdout) = stdout {
+                        let sender_clone = sender.clone();
+                        std::thread::spawn(move || {
+                            use std::io::BufRead;
+                            let reader = std::io::BufReader::new(stdout);
+                            for line in reader.lines() {
+                                if let Ok(line) = line {
+                                    if line.starts_with("PAM_PROMPT_ECHO_OFF ") {
+                                        let prompt = line["PAM_PROMPT_ECHO_OFF ".len()..].to_string();
+                                        let _ = sender_clone.send(AppMessage::PromptReceived(prompt, false));
+                                    } else if line.starts_with("PAM_PROMPT_ECHO_ON ") {
+                                        let prompt = line["PAM_PROMPT_ECHO_ON ".len()..].to_string();
+                                        let _ = sender_clone.send(AppMessage::PromptReceived(prompt, true));
+                                    } else if line.starts_with("PAM_ERROR_MSG ") {
+                                        let msg = line["PAM_ERROR_MSG ".len()..].to_string();
+                                        let _ = sender_clone.send(AppMessage::StatusReceived(msg, true));
+                                    } else if line.starts_with("PAM_TEXT_INFO ") {
+                                        let msg = line["PAM_TEXT_INFO ".len()..].to_string();
+                                        let _ = sender_clone.send(AppMessage::StatusReceived(msg, false));
+                                    }
+                                }
+                            }
+                            
+                            // Wait for child helper to exit
+                            let mut lock = child_arc.lock().unwrap();
+                            if let Some(mut child) = lock.take() {
+                                drop(lock);
+                                let exit_status = child.wait();
+                                match exit_status {
+                                    Ok(status) if status.success() => {
+                                        let _ = sender_clone.send(AppMessage::AuthDone(AuthResult::Success));
+                                    }
+                                    _ => {
+                                        let _ = sender_clone.send(AppMessage::AuthDone(AuthResult::Failure("Authentication failed".to_string())));
+                                    }
+                                }
+                            }
+                        });
+                    }
+                }
+                Err(e) => {
+                    status_msg = format!("Failed to spawn helper: {}", e);
+                }
+            }
+        }
+        
+        // Store active sender for Cancel D-Bus calls
+        *ACTIVE_SENDER.lock().unwrap() = Some(sender.clone());
         
         let mut app = Self {
             font_system,
             bg,
             password_box,
             verify_btn,
+            cancel_btn,
             fingerprint_btn,
             
-            status_msg: "Authenticate using password or fingerprint".to_string(),
+            status_msg,
             status_is_error: false,
             status_is_success: false,
             
@@ -101,13 +203,17 @@ impl Application for AuthenticatorApp {
             
             simulate_mode,
             glow_timer: 0.0,
+            
+            polkit_mode,
+            helper_stdin,
+            shared_child,
         };
         
         let tx = app.tx_auth.clone();
         if app.simulate_mode {
             app.status_msg = "SIMULATION MODE: use password 'password' or click fingerprint".to_string();
             app.fingerprint_msg = "Click fingerprint sensor to scan".to_string();
-        } else {
+        } else if !app.polkit_mode {
             tokio::spawn(async move {
                 let username = std::env::var("USER").unwrap_or_else(|_| "lsgalante".to_string());
                 if let Err(e) = run_dbus_fingerprint(username, tx.clone()).await {
@@ -115,6 +221,11 @@ impl Application for AuthenticatorApp {
                     tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
                     let _ = tx.send(AuthResult::FingerprintStatus("Simulation mode active. Click icon to verify.".to_string()));
                 }
+            });
+        } else {
+            tokio::spawn(async move {
+                let username = std::env::var("USER").unwrap_or_else(|_| "lsgalante".to_string());
+                let _ = run_dbus_fingerprint(username, tx.clone()).await;
             });
         }
         
@@ -132,7 +243,7 @@ impl Application for AuthenticatorApp {
         }
     }
 
-    fn update(&mut self, msg: Self::Message, needs_rebuild: &mut bool, _exit: &mut bool) {
+    fn update(&mut self, msg: Self::Message, needs_rebuild: &mut bool, exit: &mut bool) {
         *needs_rebuild = true;
         match msg {
             AppMessage::PasswordVerify => {
@@ -141,31 +252,39 @@ impl Application for AuthenticatorApp {
                 self.status_msg = "Verifying password...".to_string();
                 self.status_is_error = false;
                 
-                let tx = self.tx_auth.clone();
-                let simulate = self.simulate_mode;
-                tokio::spawn(async move {
-                    if simulate {
-                        tokio::time::sleep(std::time::Duration::from_millis(800)).await;
-                        if password == "password" || password.is_empty() {
-                            let _ = tx.send(AuthResult::Success);
-                        } else {
-                            let _ = tx.send(AuthResult::Failure("Invalid password (use 'password' or empty)".to_string()));
-                        }
-                    } else {
-                        let username = std::env::var("USER").unwrap_or_else(|_| "lsgalante".to_string());
-                        match tokio::task::spawn_blocking(move || run_pam_auth(&username, &password)).await {
-                            Ok(Ok(())) => {
-                                let _ = tx.send(AuthResult::Success);
-                            }
-                            Ok(Err(e)) => {
-                                let _ = tx.send(AuthResult::Failure(e));
-                            }
-                            Err(_) => {
-                                let _ = tx.send(AuthResult::Failure("Auth task panicked".to_string()));
-                            }
-                        }
+                if self.polkit_mode {
+                    if let Some(ref mut stdin) = self.helper_stdin {
+                        let _ = writeln!(stdin, "{}", password);
+                        let _ = stdin.flush();
+                        self.password_box.text.clear();
                     }
-                });
+                } else {
+                    let tx = self.tx_auth.clone();
+                    let simulate = self.simulate_mode;
+                    tokio::spawn(async move {
+                        if simulate {
+                            tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+                            if password == "password" || password.is_empty() {
+                                let _ = tx.send(AuthResult::Success);
+                            } else {
+                                let _ = tx.send(AuthResult::Failure("Invalid password (use 'password' or empty)".to_string()));
+                            }
+                        } else {
+                            let username = std::env::var("USER").unwrap_or_else(|_| "lsgalante".to_string());
+                            match tokio::task::spawn_blocking(move || run_pam_auth(&username, &password)).await {
+                                Ok(Ok(())) => {
+                                    let _ = tx.send(AuthResult::Success);
+                                }
+                                Ok(Err(e)) => {
+                                    let _ = tx.send(AuthResult::Failure(e));
+                                }
+                                Err(_) => {
+                                    let _ = tx.send(AuthResult::Failure("Auth task panicked".to_string()));
+                                }
+                            }
+                        }
+                    });
+                }
             }
             AppMessage::FingerprintScanStart => {
                 if self.fingerprint_success || self.status_is_success { return; }
@@ -189,6 +308,23 @@ impl Application for AuthenticatorApp {
                     }
                 });
             }
+            AppMessage::Cancel => {
+                if let Some(ref shared_child) = self.shared_child {
+                    if let Some(mut child) = shared_child.lock().unwrap().take() {
+                        let _ = child.kill();
+                    }
+                }
+                *exit = true;
+            }
+            AppMessage::PromptReceived(prompt, _echo) => {
+                self.password_box.set_label(&prompt);
+                self.password_box.text.clear();
+            }
+            AppMessage::StatusReceived(msg, is_error) => {
+                self.status_msg = msg;
+                self.status_is_error = is_error;
+                self.status_is_success = false;
+            }
             AppMessage::AuthDone(res) => {
                 match res {
                     AuthResult::Success => {
@@ -199,10 +335,24 @@ impl Application for AuthenticatorApp {
                         self.status_msg = "Authentication Successful!".to_string();
                         self.fingerprint_msg = "Authenticated".to_string();
                         
-                        tokio::spawn(async move {
-                            tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
-                            std::process::exit(0);
-                        });
+                        if self.polkit_mode {
+                            if let Some(req) = ACTIVE_REQUEST.lock().unwrap().take() {
+                                let _ = req.tx_result.send(Ok(()));
+                            }
+                            let tx = self.tx_auth.clone();
+                            tokio::spawn(async move {
+                                tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+                                let _ = tx.send(AuthResult::ExitWindow);
+                            });
+                        } else {
+                            tokio::spawn(async move {
+                                tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+                                std::process::exit(0);
+                            });
+                        }
+                    }
+                    AuthResult::ExitWindow => {
+                        *exit = true;
                     }
                     AuthResult::Failure(err) => {
                         self.status_is_error = true;
@@ -281,7 +431,14 @@ impl Application for AuthenticatorApp {
         let pw_col_w = 220.0;
         
         self.password_box.set_rect(pw_col_x, pw_col_y + 20.0, pw_col_w, 36.0);
-        self.verify_btn.set_rect(pw_col_x, pw_col_y + 80.0, pw_col_w, 32.0);
+        
+        let btn_w = 100.0f32;
+        let btn_h = 32.0f32;
+        let verify_x = pw_col_x;
+        let cancel_x = pw_col_x + pw_col_w - btn_w;
+        
+        self.verify_btn.set_rect(verify_x, pw_col_y + 80.0, btn_w, btn_h);
+        self.cancel_btn.set_rect(cancel_x, pw_col_y + 80.0, btn_w, btn_h);
         
         for w in &self.widgets_iter() {
             quads.push((w.rect().0, w.rect().1, w.rect().2, w.rect().3, w.color()));
@@ -345,11 +502,11 @@ impl Application for AuthenticatorApp {
         };
         
         self.text_items.push(TextItem {
-            buffer: make_text_buffer(&mut self.font_system, &self.status_msg, 11.0),
+            buffer: make_text_buffer(&mut self.font_system, &self.status_msg, 10.0),
             x: card_x + 30.0,
             y: card_y + card_h - 40.0,
             color: status_color,
-            bounds: None,
+            bounds: Some([card_x + 30.0, card_y + card_h - 45.0, card_x + card_w - 30.0, card_y + card_h - 5.0]),
         });
     }
 
@@ -373,6 +530,13 @@ impl Application for AuthenticatorApp {
         }
         if self.verify_btn.take_click() {
             return Some(AppMessage::PasswordVerify);
+        }
+        
+        if self.cancel_btn.mouse_input(button, state, lx, ly) {
+            *needs_rebuild = true;
+        }
+        if self.cancel_btn.take_click() {
+            return Some(AppMessage::Cancel);
         }
         
         if self.fingerprint_btn.mouse_input(button, state, lx, ly) {
@@ -401,12 +565,19 @@ impl Application for AuthenticatorApp {
                 if self.password_box.focused() {
                     self.password_box.unfocus();
                     self.verify_btn.focus();
-                } else {
+                } else if self.verify_btn.focused() {
                     self.verify_btn.unfocus();
+                    self.cancel_btn.focus();
+                } else {
+                    self.cancel_btn.unfocus();
                     self.password_box.focus();
                 }
                 *needs_rebuild = true;
                 return None;
+            }
+            
+            if let Key::Named(NamedKey::Escape) = event.logical_key {
+                return Some(AppMessage::Cancel);
             }
             
             if let Key::Named(NamedKey::Enter) = event.logical_key {
@@ -430,6 +601,7 @@ impl AuthenticatorApp {
             &self.bg,
             &self.password_box,
             &self.verify_btn,
+            &self.cancel_btn,
             &self.fingerprint_btn,
         ]
     }
@@ -439,6 +611,7 @@ impl AuthenticatorApp {
             &mut self.bg,
             &mut self.password_box,
             &mut self.verify_btn,
+            &mut self.cancel_btn,
             &mut self.fingerprint_btn,
         ]
     }
@@ -563,9 +736,196 @@ async fn run_dbus_fingerprint(username: String, tx: std::sync::mpsc::Sender<Auth
     Ok(())
 }
 
+struct PolkitAgent {
+    tx_gui_req: std::sync::mpsc::Sender<GuiRequest>,
+}
+
+#[zbus::interface(name = "org.freedesktop.PolicyKit1.AuthenticationAgent")]
+impl PolkitAgent {
+    async fn begin_authentication(
+        &self,
+        _action_id: String,
+        message: String,
+        _icon_name: String,
+        _details: std::collections::HashMap<String, String>,
+        cookie: String,
+        identities: zbus::zvariant::OwnedValue,
+    ) -> zbus::fdo::Result<()> {
+        let mut username = String::new();
+        if let zbus::zvariant::Value::Array(arr) = identities.deref() {
+            if let Ok(Some(first_val)) = arr.get::<zbus::zvariant::Value>(0) {
+                if let zbus::zvariant::Value::Structure(s) = first_val {
+                    let fields = s.fields();
+                    if fields.len() >= 2 {
+                        if let zbus::zvariant::Value::Str(kind) = &fields[0] {
+                            if kind.as_str() == "unix-user" {
+                                if let zbus::zvariant::Value::Dict(dict) = &fields[1] {
+                                    if let Ok(Some(uid_val)) = dict.get::<zbus::zvariant::Value, zbus::zvariant::Value>(&zbus::zvariant::Value::from("uid")) {
+                                        let uid = match uid_val {
+                                            zbus::zvariant::Value::U32(u) => Some(u),
+                                            zbus::zvariant::Value::I32(i) => Some(i as u32),
+                                            zbus::zvariant::Value::U64(u) => Some(u as u32),
+                                            zbus::zvariant::Value::I64(i) => Some(i as u32),
+                                            _ => None,
+                                        };
+                                        if let Some(uid) = uid {
+                                            if let Some(user) = users::get_user_by_uid(uid) {
+                                                username = user.name().to_string_lossy().into_owned();
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if username.is_empty() {
+            username = std::env::var("USER").unwrap_or_else(|_| "lsgalante".to_string());
+        }
+        
+        let (tx_result, rx_result) = tokio::sync::oneshot::channel();
+        let req = GuiRequest {
+            username,
+            message,
+            cookie: cookie.clone(),
+            tx_result,
+        };
+        
+        *ACTIVE_COOKIE.lock().unwrap() = Some(cookie);
+        
+        self.tx_gui_req.send(req).map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+        
+        match rx_result.await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(err)) => Err(zbus::fdo::Error::Failed(err)),
+            Err(_) => Err(zbus::fdo::Error::Failed("GUI closed".to_string())),
+        }
+    }
+
+    async fn cancel_authentication(&self, cookie: String) -> zbus::fdo::Result<()> {
+        let mut active_cookie = ACTIVE_COOKIE.lock().unwrap();
+        if active_cookie.as_ref() == Some(&cookie) {
+            *active_cookie = None;
+            let sender_lock = ACTIVE_SENDER.lock().unwrap();
+            if let Some(ref sender) = *sender_lock {
+                let _ = sender.send(AppMessage::Cancel);
+            }
+        }
+        Ok(())
+    }
+}
+
+async fn get_system_session_id() -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    if let Ok(id) = std::env::var("XDG_SESSION_ID") {
+        return Ok(id);
+    }
+    
+    if let Ok(id_str) = std::fs::read_to_string("/proc/self/sessionid") {
+        let id_trimmed = id_str.trim();
+        if !id_trimmed.is_empty() && id_trimmed != "4294967295" {
+            return Ok(id_trimmed.to_string());
+        }
+    }
+    
+    let connection = zbus::Connection::system().await?;
+    let reply: zbus::zvariant::OwnedObjectPath = connection.call_method(
+        Some("org.freedesktop.login1"),
+        "/org/freedesktop/login1",
+        Some("org.freedesktop.login1.Manager"),
+        "GetSessionByPID",
+        &(std::process::id() as u32,),
+    ).await?.body().deserialize()?;
+    
+    if let Some(pos) = reply.as_str().rfind('/') {
+        let id = reply.as_str()[pos + 1..].to_string();
+        let id = if id.starts_with('_') { id[1..].to_string() } else { id };
+        return Ok(id);
+    }
+    
+    Err("Session ID not found".into())
+}
+
+async fn run_polkit_agent_daemon(tx_gui_req: std::sync::mpsc::Sender<GuiRequest>) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let connection = zbus::Connection::system().await?;
+    let session_id = get_system_session_id().await?;
+    
+    let agent = PolkitAgent { tx_gui_req };
+    connection.object_server().at("/org/cce/AuthenticatorAgent", agent).await?;
+    
+    let mut details = std::collections::HashMap::new();
+    details.insert("session-id".to_string(), zbus::zvariant::Value::from(session_id.clone()));
+    let subject = (
+        "unix-session".to_string(),
+        details,
+    );
+    let object_path = zbus::zvariant::ObjectPath::try_from("/org/cce/AuthenticatorAgent")?;
+    
+    println!("Registering CCE Authenticator agent for session {}", session_id);
+    connection.call_method(
+        Some("org.freedesktop.PolicyKit1"),
+        "/org/freedesktop/PolicyKit1/Authority",
+        Some("org.freedesktop.PolicyKit1.Authority"),
+        "RegisterAuthenticationAgent",
+        &(subject.clone(), "en_US.UTF-8", object_path.clone()),
+    ).await?;
+    
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut sigterm = signal(SignalKind::terminate())?;
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = sigterm.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
+    
+    println!("Unregistering CCE Authenticator agent...");
+    let _ = connection.call_method(
+        Some("org.freedesktop.PolicyKit1"),
+        "/org/freedesktop/PolicyKit1/Authority",
+        Some("org.freedesktop.PolicyKit1.Authority"),
+        "UnregisterAuthenticationAgent",
+        &(subject, object_path),
+    ).await;
+    
+    Ok(())
+}
+
 fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    let standalone = args.contains(&"--standalone".to_string()) || args.contains(&"-s".to_string());
+    
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
     let _guard = rt.enter();
-
-    clear_ui::engine::run::<AuthenticatorApp>();
+    
+    if standalone {
+        clear_ui::engine::run::<AuthenticatorApp>();
+    } else {
+        let (tx_gui_req, rx_gui_req) = std::sync::mpsc::channel::<GuiRequest>();
+        
+        rt.spawn(async move {
+            if let Err(e) = run_polkit_agent_daemon(tx_gui_req).await {
+                eprintln!("Error starting Polkit agent: {}", e);
+                std::process::exit(1);
+            }
+        });
+        
+        while let Ok(req) = rx_gui_req.recv() {
+            *ACTIVE_REQUEST.lock().unwrap() = Some(req);
+            
+            clear_ui::engine::run::<AuthenticatorApp>();
+            
+            *ACTIVE_SENDER.lock().unwrap() = None;
+            *ACTIVE_COOKIE.lock().unwrap() = None;
+            if let Some(req) = ACTIVE_REQUEST.lock().unwrap().take() {
+                let _ = req.tx_result.send(Err("Authentication cancelled".to_string()));
+            }
+        }
+    }
 }
