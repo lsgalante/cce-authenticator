@@ -749,33 +749,23 @@ impl PolkitAgent {
         _icon_name: String,
         _details: std::collections::HashMap<String, String>,
         cookie: String,
-        identities: zbus::zvariant::OwnedValue,
+        identities: Vec<(String, std::collections::HashMap<String, zbus::zvariant::OwnedValue>)>,
     ) -> zbus::fdo::Result<()> {
+        println!("begin_authentication called! message = {:?}, cookie = {:?}", message, cookie);
         let mut username = String::new();
-        if let zbus::zvariant::Value::Array(arr) = identities.deref() {
-            if let Ok(Some(first_val)) = arr.get::<zbus::zvariant::Value>(0) {
-                if let zbus::zvariant::Value::Structure(s) = first_val {
-                    let fields = s.fields();
-                    if fields.len() >= 2 {
-                        if let zbus::zvariant::Value::Str(kind) = &fields[0] {
-                            if kind.as_str() == "unix-user" {
-                                if let zbus::zvariant::Value::Dict(dict) = &fields[1] {
-                                    if let Ok(Some(uid_val)) = dict.get::<zbus::zvariant::Value, zbus::zvariant::Value>(&zbus::zvariant::Value::from("uid")) {
-                                        let uid = match uid_val {
-                                            zbus::zvariant::Value::U32(u) => Some(u),
-                                            zbus::zvariant::Value::I32(i) => Some(i as u32),
-                                            zbus::zvariant::Value::U64(u) => Some(u as u32),
-                                            zbus::zvariant::Value::I64(i) => Some(i as u32),
-                                            _ => None,
-                                        };
-                                        if let Some(uid) = uid {
-                                            if let Some(user) = users::get_user_by_uid(uid) {
-                                                username = user.name().to_string_lossy().into_owned();
-                                            }
-                                        }
-                                    }
-                                }
-                            }
+        if let Some((kind, details)) = identities.first() {
+            if kind == "unix-user" {
+                if let Some(uid_val) = details.get("uid") {
+                    let uid = match uid_val.deref() {
+                        zbus::zvariant::Value::U32(u) => Some(*u),
+                        zbus::zvariant::Value::I32(i) => Some(*i as u32),
+                        zbus::zvariant::Value::U64(u) => Some(*u as u32),
+                        zbus::zvariant::Value::I64(i) => Some(*i as u32),
+                        _ => None,
+                    };
+                    if let Some(uid) = uid {
+                        if let Some(user) = users::get_user_by_uid(uid) {
+                            username = user.name().to_string_lossy().into_owned();
                         }
                     }
                 }
@@ -870,6 +860,7 @@ async fn run_polkit_agent_daemon(tx_gui_req: std::sync::mpsc::Sender<GuiRequest>
         "RegisterAuthenticationAgent",
         &(subject.clone(), "en_US.UTF-8", object_path.as_str()),
     ).await?;
+    println!("Successfully registered CCE Authenticator agent!");
     
     #[cfg(unix)]
     {
