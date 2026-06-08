@@ -860,7 +860,7 @@ async fn run_polkit_agent_daemon(tx_gui_req: std::sync::mpsc::Sender<GuiRequest>
         "unix-session".to_string(),
         details,
     );
-    let object_path = zbus::zvariant::ObjectPath::try_from("/org/cce/AuthenticatorAgent")?;
+        let object_path = zbus::zvariant::ObjectPath::try_from("/org/cce/AuthenticatorAgent")?;
     
     println!("Registering CCE Authenticator agent for session {}", session_id);
     connection.call_method(
@@ -868,7 +868,7 @@ async fn run_polkit_agent_daemon(tx_gui_req: std::sync::mpsc::Sender<GuiRequest>
         "/org/freedesktop/PolicyKit1/Authority",
         Some("org.freedesktop.PolicyKit1.Authority"),
         "RegisterAuthenticationAgent",
-        &(subject.clone(), "en_US.UTF-8", object_path.clone()),
+        &(subject.clone(), "en_US.UTF-8", object_path.as_str()),
     ).await?;
     
     #[cfg(unix)]
@@ -891,7 +891,7 @@ async fn run_polkit_agent_daemon(tx_gui_req: std::sync::mpsc::Sender<GuiRequest>
         "/org/freedesktop/PolicyKit1/Authority",
         Some("org.freedesktop.PolicyKit1.Authority"),
         "UnregisterAuthenticationAgent",
-        &(subject, object_path),
+        &(subject, object_path.as_str()),
     ).await;
     
     Ok(())
