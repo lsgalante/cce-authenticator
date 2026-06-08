@@ -80,6 +80,7 @@ struct AuthenticatorApp {
     polkit_mode: bool,
     helper_stdin: Option<std::process::ChildStdin>,
     shared_child: Option<Arc<Mutex<Option<std::process::Child>>>>,
+    sender: calloop::channel::Sender<AppMessage>,
 }
 
 impl Application for AuthenticatorApp {
@@ -110,67 +111,71 @@ impl Application for AuthenticatorApp {
         
         if let Some(ref req) = *active_req {
             status_msg = req.message.clone();
-            simulate_mode = false;
+            if std::env::var("CCE_AUTH_SIMULATE").is_err() {
+                simulate_mode = false;
+            }
             
-            // Spawn polkit-agent-helper-1
-            match std::process::Command::new("/usr/lib/polkit-1/polkit-agent-helper-1")
-                .arg(&req.username)
-                .arg(&req.cookie)
-                .stdin(std::process::Stdio::piped())
-                .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::inherit())
-                .spawn()
-            {
-                Ok(mut child) => {
-                    let stdin = child.stdin.take();
-                    let stdout = child.stdout.take();
-                    helper_stdin = stdin;
-                    
-                    let child_arc = Arc::new(Mutex::new(Some(child)));
-                    shared_child = Some(child_arc.clone());
-                    
-                    if let Some(stdout) = stdout {
-                        let sender_clone = sender.clone();
-                        std::thread::spawn(move || {
-                            use std::io::BufRead;
-                            let reader = std::io::BufReader::new(stdout);
-                            for line in reader.lines() {
-                                if let Ok(line) = line {
-                                    if line.starts_with("PAM_PROMPT_ECHO_OFF ") {
-                                        let prompt = line["PAM_PROMPT_ECHO_OFF ".len()..].to_string();
-                                        let _ = sender_clone.send(AppMessage::PromptReceived(prompt, false));
-                                    } else if line.starts_with("PAM_PROMPT_ECHO_ON ") {
-                                        let prompt = line["PAM_PROMPT_ECHO_ON ".len()..].to_string();
-                                        let _ = sender_clone.send(AppMessage::PromptReceived(prompt, true));
-                                    } else if line.starts_with("PAM_ERROR_MSG ") {
-                                        let msg = line["PAM_ERROR_MSG ".len()..].to_string();
-                                        let _ = sender_clone.send(AppMessage::StatusReceived(msg, true));
-                                    } else if line.starts_with("PAM_TEXT_INFO ") {
-                                        let msg = line["PAM_TEXT_INFO ".len()..].to_string();
-                                        let _ = sender_clone.send(AppMessage::StatusReceived(msg, false));
+            if !simulate_mode {
+                // Spawn polkit-agent-helper-1
+                match std::process::Command::new("/usr/lib/polkit-1/polkit-agent-helper-1")
+                    .arg(&req.username)
+                    .arg(&req.cookie)
+                    .stdin(std::process::Stdio::piped())
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::inherit())
+                    .spawn()
+                {
+                    Ok(mut child) => {
+                        let stdin = child.stdin.take();
+                        let stdout = child.stdout.take();
+                        helper_stdin = stdin;
+                        
+                        let child_arc = Arc::new(Mutex::new(Some(child)));
+                        shared_child = Some(child_arc.clone());
+                        
+                        if let Some(stdout) = stdout {
+                            let sender_clone = sender.clone();
+                            std::thread::spawn(move || {
+                                use std::io::BufRead;
+                                let reader = std::io::BufReader::new(stdout);
+                                for line in reader.lines() {
+                                    if let Ok(line) = line {
+                                        if line.starts_with("PAM_PROMPT_ECHO_OFF ") {
+                                            let prompt = line["PAM_PROMPT_ECHO_OFF ".len()..].to_string();
+                                            let _ = sender_clone.send(AppMessage::PromptReceived(prompt, false));
+                                        } else if line.starts_with("PAM_PROMPT_ECHO_ON ") {
+                                            let prompt = line["PAM_PROMPT_ECHO_ON ".len()..].to_string();
+                                            let _ = sender_clone.send(AppMessage::PromptReceived(prompt, true));
+                                        } else if line.starts_with("PAM_ERROR_MSG ") {
+                                            let msg = line["PAM_ERROR_MSG ".len()..].to_string();
+                                            let _ = sender_clone.send(AppMessage::StatusReceived(msg, true));
+                                        } else if line.starts_with("PAM_TEXT_INFO ") {
+                                            let msg = line["PAM_TEXT_INFO ".len()..].to_string();
+                                            let _ = sender_clone.send(AppMessage::StatusReceived(msg, false));
+                                        }
                                     }
                                 }
-                            }
-                            
-                            // Wait for child helper to exit
-                            let mut lock = child_arc.lock().unwrap();
-                            if let Some(mut child) = lock.take() {
-                                drop(lock);
-                                let exit_status = child.wait();
-                                match exit_status {
-                                    Ok(status) if status.success() => {
-                                        let _ = sender_clone.send(AppMessage::AuthDone(AuthResult::Success));
-                                    }
-                                    _ => {
-                                        let _ = sender_clone.send(AppMessage::AuthDone(AuthResult::Failure("Authentication failed".to_string())));
+                                
+                                // Wait for child helper to exit
+                                let mut lock = child_arc.lock().unwrap();
+                                if let Some(mut child) = lock.take() {
+                                    drop(lock);
+                                    let exit_status = child.wait();
+                                    match exit_status {
+                                        Ok(status) if status.success() => {
+                                            let _ = sender_clone.send(AppMessage::AuthDone(AuthResult::Success));
+                                        }
+                                        _ => {
+                                            let _ = sender_clone.send(AppMessage::AuthDone(AuthResult::Failure("Authentication failed".to_string())));
+                                        }
                                     }
                                 }
-                            }
-                        });
+                            });
+                        }
                     }
-                }
-                Err(e) => {
-                    status_msg = format!("Failed to spawn helper: {}", e);
+                    Err(e) => {
+                        status_msg = format!("Failed to spawn helper: {}", e);
+                    }
                 }
             }
         }
@@ -207,6 +212,7 @@ impl Application for AuthenticatorApp {
             polkit_mode,
             helper_stdin,
             shared_child,
+            sender: sender.clone(),
         };
         
         let tx = app.tx_auth.clone();
@@ -371,7 +377,7 @@ impl Application for AuthenticatorApp {
 
     fn tick(&mut self, dt: f32, needs_rebuild: &mut bool) {
         while let Ok(res) = self.rx_auth.try_recv() {
-            self.update(AppMessage::AuthDone(res), needs_rebuild, &mut false);
+            let _ = self.sender.send(AppMessage::AuthDone(res));
         }
         
         if self.fingerprint_active {
