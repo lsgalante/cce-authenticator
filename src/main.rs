@@ -314,8 +314,6 @@ impl Application for AuthenticatorApp {
                         let username = std::env::var("USER").unwrap_or_else(|_| "lsgalante".to_string());
                         if let Err(e) = run_dbus_fingerprint(username, tx.clone()).await {
                             let _ = tx.send(AuthResult::FingerprintStatus(format!("Scan error: {}", e)));
-                            tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
-                            let _ = tx.send(AuthResult::Success); 
                         }
                     }
                 });
