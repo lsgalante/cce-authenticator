@@ -219,6 +219,12 @@ impl Application for AuthenticatorApp {
         if app.simulate_mode {
             app.status_msg = "SIMULATION MODE: use password 'password' or click fingerprint".to_string();
             app.fingerprint_msg = "Click fingerprint sensor to scan".to_string();
+            let tx_clone = tx.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                println!("Auto-authenticating in simulation mode...");
+                let _ = tx_clone.send(AuthResult::Success);
+            });
         } else if !app.polkit_mode {
             tokio::spawn(async move {
                 let username = std::env::var("USER").unwrap_or_else(|_| "lsgalante".to_string());
@@ -258,7 +264,7 @@ impl Application for AuthenticatorApp {
                 self.status_msg = "Verifying password...".to_string();
                 self.status_is_error = false;
                 
-                if self.polkit_mode {
+                if self.polkit_mode && !self.simulate_mode {
                     if let Some(ref mut stdin) = self.helper_stdin {
                         let _ = writeln!(stdin, "{}", password);
                         let _ = stdin.flush();
@@ -332,6 +338,7 @@ impl Application for AuthenticatorApp {
                 self.status_is_success = false;
             }
             AppMessage::AuthDone(res) => {
+                println!("AppMessage::AuthDone received: {:?}", res);
                 match res {
                     AuthResult::Success => {
                         self.status_is_success = true;
@@ -342,15 +349,21 @@ impl Application for AuthenticatorApp {
                         self.fingerprint_msg = "Authenticated".to_string();
                         
                         if self.polkit_mode {
+                            println!("AuthResult::Success in Polkit mode. Sending Ok to tx_result and spawning exit timer.");
                             if let Some(req) = ACTIVE_REQUEST.lock().unwrap().take() {
                                 let _ = req.tx_result.send(Ok(()));
+                            } else {
+                                println!("WARNING: ACTIVE_REQUEST was None inside AuthDone(Success)!");
                             }
                             let tx = self.tx_auth.clone();
                             tokio::spawn(async move {
+                                println!("Exit timer task spawned, sleeping 800ms...");
                                 tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+                                println!("Exit timer slept 800ms. Sending ExitWindow to tx.");
                                 let _ = tx.send(AuthResult::ExitWindow);
                             });
                         } else {
+                            println!("AuthResult::Success in standalone mode. Exiting process in 1000ms.");
                             tokio::spawn(async move {
                                 tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
                                 std::process::exit(0);
@@ -358,13 +371,16 @@ impl Application for AuthenticatorApp {
                         }
                     }
                     AuthResult::ExitWindow => {
+                        println!("AuthResult::ExitWindow received in update. Setting exit = true.");
                         *exit = true;
                     }
                     AuthResult::Failure(err) => {
+                        println!("AuthResult::Failure received: {}", err);
                         self.status_is_error = true;
                         self.status_msg = err;
                     }
                     AuthResult::FingerprintStatus(status) => {
+                        println!("AuthResult::FingerprintStatus received: {}", status);
                         if status.contains("Simulation mode active") || status.contains("No reader") {
                             self.simulate_mode = true;
                         }
@@ -914,15 +930,22 @@ fn main() {
         });
         
         while let Ok(req) = rx_gui_req.recv() {
+            println!("rx_gui_req received a request for user: {}, message: {}", req.username, req.message);
             *ACTIVE_REQUEST.lock().unwrap() = Some(req);
             
+            println!("Starting clear_ui::engine::run...");
             clear_ui::engine::run::<AuthenticatorApp>();
+            println!("clear_ui::engine::run returned/exited!");
             
             *ACTIVE_SENDER.lock().unwrap() = None;
             *ACTIVE_COOKIE.lock().unwrap() = None;
             if let Some(req) = ACTIVE_REQUEST.lock().unwrap().take() {
+                println!("ACTIVE_REQUEST still present, sending Cancelled to tx_result");
                 let _ = req.tx_result.send(Err("Authentication cancelled".to_string()));
+            } else {
+                println!("ACTIVE_REQUEST was already taken (success/done).");
             }
+            println!("Waiting for next rx_gui_req...");
         }
     }
 }
