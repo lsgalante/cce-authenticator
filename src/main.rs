@@ -709,8 +709,8 @@ async fn run_dbus_fingerprint(username: String, tx: std::sync::mpsc::Sender<Auth
         Some("net.reactivated.Fprint"),
         device_path_str,
         Some("net.reactivated.Fprint.Device"),
-        "StartVerify",
-        &(),
+        "VerifyStart",
+        &("any",),
     ).await?;
     
     let mut stream = zbus::MessageStream::for_match_rule(
