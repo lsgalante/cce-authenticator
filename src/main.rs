@@ -15,7 +15,9 @@ const ACCENT: [f32; 4] = [0.30, 0.50, 0.32, 1.0];
 const TOGGLE_OFF: [f32; 4] = [0.16, 0.16, 0.24, 1.0];
 
 fn make_text_buffer(fs: &mut FontSystem, text: &str, size: f32) -> Buffer {
-    let metrics = Metrics::new(size, size * 1.4);
+    let scale = clear_ui::scale::scale_factor();
+    let physical_size = size * scale;
+    let metrics = Metrics::new(physical_size, physical_size * 1.4);
     let mut buf = Buffer::new(fs, metrics);
     buf.set_text(fs, text, Attrs::new(), glyphon::Shaping::Advanced);
     buf.shape_until_scroll(fs, true);
@@ -81,6 +83,7 @@ struct AuthenticatorApp {
     helper_stdin: Option<std::process::ChildStdin>,
     shared_child: Option<Arc<Mutex<Option<std::process::Child>>>>,
     sender: calloop::channel::Sender<AppMessage>,
+    ui_context: clear_ui::context::UiContext,
 }
 
 impl Application for AuthenticatorApp {
@@ -213,6 +216,7 @@ impl Application for AuthenticatorApp {
             helper_stdin,
             shared_child,
             sender: sender.clone(),
+            ui_context: clear_ui::context::UiContext::new(),
         };
         
         let tx = app.tx_auth.clone();
@@ -235,10 +239,8 @@ impl Application for AuthenticatorApp {
                 }
             });
         } else {
-            tokio::spawn(async move {
-                let username = std::env::var("USER").unwrap_or_else(|_| "lsgalante".to_string());
-                let _ = run_dbus_fingerprint(username, tx.clone()).await;
-            });
+            // In Polkit mode, pam_fprintd.so running inside polkit-agent-helper-1
+            // will handle claiming and verifying the fingerprint reader natively.
         }
         
         app
@@ -300,6 +302,10 @@ impl Application for AuthenticatorApp {
             }
             AppMessage::FingerprintScanStart => {
                 if self.fingerprint_success || self.status_is_success { return; }
+                if self.polkit_mode && !self.simulate_mode {
+                    // PAM fprintd handles the hardware reader natively in Polkit mode
+                    return;
+                }
                 self.fingerprint_active = true;
                 self.fingerprint_msg = "Place finger on reader...".to_string();
                 
@@ -331,9 +337,13 @@ impl Application for AuthenticatorApp {
                 self.password_box.text.clear();
             }
             AppMessage::StatusReceived(msg, is_error) => {
-                self.status_msg = msg;
+                self.status_msg = msg.clone();
                 self.status_is_error = is_error;
                 self.status_is_success = false;
+                if msg.to_lowercase().contains("finger") {
+                    self.fingerprint_active = true;
+                    self.fingerprint_msg = msg;
+                }
             }
             AppMessage::AuthDone(res) => {
                 println!("AppMessage::AuthDone received: {:?}", res);
@@ -400,7 +410,8 @@ impl Application for AuthenticatorApp {
         }
     }
 
-    fn view(&mut self, quads: &mut Vec<(f32, f32, f32, f32, [f32; 4])>, size: LogicalSize, _scale: f64) {
+    fn view(&mut self, quads: &mut Vec<(f32, f32, f32, f32, [f32; 4])>, size: LogicalSize, scale: f64) {
+        clear_ui::scale::set_scale_factor(scale as f32);
         let sw = size.width as f32;
         let sh = size.height as f32;
         self.width = sw;
@@ -535,31 +546,32 @@ impl Application for AuthenticatorApp {
     }
 
     fn handle_pointer_move(&mut self, pos: LogicalPosition, needs_rebuild: &mut bool) {
-        for w in self.widgets_iter_mut() {
-            if w.cursor_moved(pos.x, pos.y) {
-                *needs_rebuild = true;
-            }
-        }
+        let ctx = &mut self.ui_context;
+        if self.bg.cursor_moved(pos.x, pos.y, ctx) { *needs_rebuild = true; }
+        if self.password_box.cursor_moved(pos.x, pos.y, ctx) { *needs_rebuild = true; }
+        if self.verify_btn.cursor_moved(pos.x, pos.y, ctx) { *needs_rebuild = true; }
+        if self.cancel_btn.cursor_moved(pos.x, pos.y, ctx) { *needs_rebuild = true; }
+        if self.fingerprint_btn.cursor_moved(pos.x, pos.y, ctx) { *needs_rebuild = true; }
     }
 
     fn handle_mouse_input(&mut self, button: MouseButton, state: ElementState, pos: LogicalPosition, needs_rebuild: &mut bool) -> Option<Self::Message> {
         let (lx, ly) = (pos.x, pos.y);
         
-        if self.verify_btn.mouse_input(button, state, lx, ly) {
+        if self.verify_btn.mouse_input(button, state, lx, ly, &mut self.ui_context) {
             *needs_rebuild = true;
         }
         if self.verify_btn.take_click() {
             return Some(AppMessage::PasswordVerify);
         }
         
-        if self.cancel_btn.mouse_input(button, state, lx, ly) {
+        if self.cancel_btn.mouse_input(button, state, lx, ly, &mut self.ui_context) {
             *needs_rebuild = true;
         }
         if self.cancel_btn.take_click() {
             return Some(AppMessage::Cancel);
         }
         
-        if self.fingerprint_btn.mouse_input(button, state, lx, ly) {
+        if self.fingerprint_btn.mouse_input(button, state, lx, ly, &mut self.ui_context) {
             *needs_rebuild = true;
         }
         if self.fingerprint_btn.take_click() {
@@ -567,10 +579,10 @@ impl Application for AuthenticatorApp {
         }
         
         let tb = &mut self.password_box;
-        if state == ElementState::Pressed && !tb.hit_test(lx, ly) {
+        if state == ElementState::Pressed && !tb.hit_test(lx, ly, &self.ui_context) {
             tb.unfocus();
         }
-        if tb.mouse_input(button, state, lx, ly) {
+        if tb.mouse_input(button, state, lx, ly, &mut self.ui_context) {
             *needs_rebuild = true;
         }
         
@@ -582,10 +594,10 @@ impl Application for AuthenticatorApp {
     fn handle_key_input(&mut self, event: &KeyEvent, needs_rebuild: &mut bool) -> Option<Self::Message> {
         if event.state == ElementState::Pressed && !event.repeat {
             if let Key::Named(NamedKey::Tab) = event.logical_key {
-                if self.password_box.focused() {
+                if self.password_box.focused(&self.ui_context) {
                     self.password_box.unfocus();
                     self.verify_btn.focus();
-                } else if self.verify_btn.focused() {
+                } else if self.verify_btn.focused(&self.ui_context) {
                     self.verify_btn.unfocus();
                     self.cancel_btn.focus();
                 } else {
@@ -601,13 +613,13 @@ impl Application for AuthenticatorApp {
             }
             
             if let Key::Named(NamedKey::Enter) = event.logical_key {
-                if self.password_box.focused() {
+                if self.password_box.focused(&self.ui_context) {
                     return Some(AppMessage::PasswordVerify);
                 }
             }
         }
         
-        if self.password_box.keyboard_input(event) {
+        if self.password_box.keyboard_input(event, &mut self.ui_context) {
             *needs_rebuild = true;
         }
         
