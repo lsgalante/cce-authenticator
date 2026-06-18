@@ -1,6 +1,6 @@
 use wayland_client::QueueHandle;
-use clear_ui::engine::{Application, EngineState, LogicalPosition, LogicalSize, WindowSettings};
-use clear_ui::widget::{
+use cce_ui::engine::{Application, EngineState, LogicalPosition, LogicalSize, WindowSettings};
+use cce_ui::widget::{
     Button, ContentBg, Element, ElementState, MouseButton, Key, NamedKey, KeyEvent, TextBox,
     TextItem, MouseScrollDelta
 };
@@ -15,7 +15,7 @@ const ACCENT: [f32; 4] = [0.30, 0.50, 0.32, 1.0];
 const TOGGLE_OFF: [f32; 4] = [0.16, 0.16, 0.24, 1.0];
 
 fn make_text_buffer(fs: &mut FontSystem, text: &str, size: f32) -> Buffer {
-    let scale = clear_ui::scale::scale_factor();
+    let scale = cce_ui::scale::scale_factor();
     let physical_size = size * scale;
     let metrics = Metrics::new(physical_size, physical_size * 1.4);
     let mut buf = Buffer::new(fs, metrics);
@@ -83,7 +83,7 @@ struct AuthenticatorApp {
     helper_stdin: Option<std::process::ChildStdin>,
     shared_child: Option<Arc<Mutex<Option<std::process::Child>>>>,
     sender: calloop::channel::Sender<AppMessage>,
-    ui_context: clear_ui::context::UiContext,
+    ui_context: cce_ui::context::UiContext,
 }
 
 impl Application for AuthenticatorApp {
@@ -216,7 +216,7 @@ impl Application for AuthenticatorApp {
             helper_stdin,
             shared_child,
             sender: sender.clone(),
-            ui_context: clear_ui::context::UiContext::new(),
+            ui_context: cce_ui::context::UiContext::new(),
         };
         
         let tx = app.tx_auth.clone();
@@ -411,7 +411,7 @@ impl Application for AuthenticatorApp {
     }
 
     fn view(&mut self, quads: &mut Vec<(f32, f32, f32, f32, [f32; 4])>, size: LogicalSize, scale: f64) {
-        clear_ui::scale::set_scale_factor(scale as f32);
+        cce_ui::scale::set_scale_factor(scale as f32);
         let sw = size.width as f32;
         let sh = size.height as f32;
         self.width = sw;
@@ -928,7 +928,7 @@ fn main() {
     let _guard = rt.enter();
     
     if standalone {
-        clear_ui::engine::run::<AuthenticatorApp>();
+        cce_ui::engine::run::<AuthenticatorApp>();
     } else {
         let (tx_gui_req, rx_gui_req) = std::sync::mpsc::channel::<GuiRequest>();
         
@@ -943,9 +943,9 @@ fn main() {
             println!("rx_gui_req received a request for user: {}, message: {}", req.username, req.message);
             *ACTIVE_REQUEST.lock().unwrap() = Some(req);
             
-            println!("Starting clear_ui::engine::run...");
-            clear_ui::engine::run::<AuthenticatorApp>();
-            println!("clear_ui::engine::run returned/exited!");
+            println!("Starting cce_ui::engine::run...");
+            cce_ui::engine::run::<AuthenticatorApp>();
+            println!("cce_ui::engine::run returned/exited!");
             
             *ACTIVE_SENDER.lock().unwrap() = None;
             *ACTIVE_COOKIE.lock().unwrap() = None;

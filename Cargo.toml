@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-clear-ui = { path = "../clear-ui" }
+cce-ui = { path = "../cce-ui" }
 pam = "0.7.0"
 pam-sys = "0.5.6"
 libc = "0.2"
