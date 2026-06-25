@@ -230,7 +230,7 @@ impl Application for AuthenticatorApp {
             let tx_clone = tx.clone();
             tokio::spawn(async move {
                 tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                println!("Auto-authenticating in simulation mode...");
+                log::info!("Auto-authenticating in simulation mode...");
                 let _ = tx_clone.send(AuthResult::Success);
             });
         } else if !app.polkit_mode {
@@ -350,7 +350,7 @@ impl Application for AuthenticatorApp {
                 }
             }
             AppMessage::AuthDone(res) => {
-                println!("AppMessage::AuthDone received: {:?}", res);
+                log::debug!("AppMessage::AuthDone received: {:?}", res);
                 match res {
                     AuthResult::Success => {
                         self.status_is_success = true;
@@ -361,21 +361,21 @@ impl Application for AuthenticatorApp {
                         self.fingerprint_msg = "Authenticated".to_string();
                         
                         if self.polkit_mode {
-                            println!("AuthResult::Success in Polkit mode. Sending Ok to tx_result and spawning exit timer.");
+                            log::info!("AuthResult::Success in Polkit mode. Sending Ok to tx_result and spawning exit timer.");
                             if let Some(req) = ACTIVE_REQUEST.lock().unwrap().take() {
                                 let _ = req.tx_result.send(Ok(()));
                             } else {
-                                println!("WARNING: ACTIVE_REQUEST was None inside AuthDone(Success)!");
+                                log::warn!("WARNING: ACTIVE_REQUEST was None inside AuthDone(Success)!");
                             }
                             let tx = self.tx_auth.clone();
                             tokio::spawn(async move {
-                                println!("Exit timer task spawned, sleeping 800ms...");
+                                log::debug!("Exit timer task spawned, sleeping 800ms...");
                                 tokio::time::sleep(std::time::Duration::from_millis(800)).await;
-                                println!("Exit timer slept 800ms. Sending ExitWindow to tx.");
+                                log::debug!("Exit timer slept 800ms. Sending ExitWindow to tx.");
                                 let _ = tx.send(AuthResult::ExitWindow);
                             });
                         } else {
-                            println!("AuthResult::Success in standalone mode. Exiting process in 1000ms.");
+                            log::info!("AuthResult::Success in standalone mode. Exiting process in 1000ms.");
                             tokio::spawn(async move {
                                 tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
                                 std::process::exit(0);
@@ -383,16 +383,16 @@ impl Application for AuthenticatorApp {
                         }
                     }
                     AuthResult::ExitWindow => {
-                        println!("AuthResult::ExitWindow received in update. Setting exit = true.");
+                        log::info!("AuthResult::ExitWindow received in update. Setting exit = true.");
                         *exit = true;
                     }
                     AuthResult::Failure(err) => {
-                        println!("AuthResult::Failure received: {}", err);
+                        log::error!("AuthResult::Failure received: {}", err);
                         self.status_is_error = true;
                         self.status_msg = err;
                     }
                     AuthResult::FingerprintStatus(status) => {
-                        println!("AuthResult::FingerprintStatus received: {}", status);
+                        log::info!("AuthResult::FingerprintStatus received: {}", status);
                         if status.contains("Simulation mode active") || status.contains("No reader") {
                             self.simulate_mode = true;
                         }
@@ -788,7 +788,7 @@ impl PolkitAgent {
         cookie: String,
         identities: Vec<(String, std::collections::HashMap<String, zbus::zvariant::OwnedValue>)>,
     ) -> zbus::fdo::Result<()> {
-        println!("begin_authentication called! message = {:?}, cookie = {:?}", message, cookie);
+        log::info!("begin_authentication called! message = {:?}, cookie = {:?}", message, cookie);
         let mut username = String::new();
         if let Some((kind, details)) = identities.first() {
             if kind == "unix-user" {
@@ -889,7 +889,7 @@ async fn run_polkit_agent_daemon(tx_gui_req: std::sync::mpsc::Sender<GuiRequest>
     );
         let object_path = zbus::zvariant::ObjectPath::try_from("/org/cce/AuthenticatorAgent")?;
     
-    println!("Registering CCE Authenticator agent for session {}", session_id);
+    log::info!("Registering CCE Authenticator agent for session {}", session_id);
     connection.call_method(
         Some("org.freedesktop.PolicyKit1"),
         "/org/freedesktop/PolicyKit1/Authority",
@@ -897,7 +897,7 @@ async fn run_polkit_agent_daemon(tx_gui_req: std::sync::mpsc::Sender<GuiRequest>
         "RegisterAuthenticationAgent",
         &(subject.clone(), "en_US.UTF-8", object_path.as_str()),
     ).await?;
-    println!("Successfully registered CCE Authenticator agent!");
+    log::info!("Successfully registered CCE Authenticator agent!");
     
     #[cfg(unix)]
     {
@@ -913,7 +913,7 @@ async fn run_polkit_agent_daemon(tx_gui_req: std::sync::mpsc::Sender<GuiRequest>
         let _ = tokio::signal::ctrl_c().await;
     }
     
-    println!("Unregistering CCE Authenticator agent...");
+    log::info!("Unregistering CCE Authenticator agent...");
     let _ = connection.call_method(
         Some("org.freedesktop.PolicyKit1"),
         "/org/freedesktop/PolicyKit1/Authority",
@@ -926,6 +926,7 @@ async fn run_polkit_agent_daemon(tx_gui_req: std::sync::mpsc::Sender<GuiRequest>
 }
 
 fn main() {
+    env_logger::init();
     let args: Vec<String> = std::env::args().collect();
     let standalone = args.contains(&"--standalone".to_string()) || args.contains(&"-s".to_string());
     
@@ -939,28 +940,28 @@ fn main() {
         
         rt.spawn(async move {
             if let Err(e) = run_polkit_agent_daemon(tx_gui_req).await {
-                eprintln!("Error starting Polkit agent: {}", e);
+                log::error!("Error starting Polkit agent: {}", e);
                 std::process::exit(1);
             }
         });
         
         while let Ok(req) = rx_gui_req.recv() {
-            println!("rx_gui_req received a request for user: {}, message: {}", req.username, req.message);
+            log::info!("rx_gui_req received a request for user: {}, message: {}", req.username, req.message);
             *ACTIVE_REQUEST.lock().unwrap() = Some(req);
             
-            println!("Starting cce_ui::engine::run...");
+            log::info!("Starting cce_ui::engine::run...");
             cce_ui::engine::run::<AuthenticatorApp>();
-            println!("cce_ui::engine::run returned/exited!");
+            log::info!("cce_ui::engine::run returned/exited!");
             
             *ACTIVE_SENDER.lock().unwrap() = None;
             *ACTIVE_COOKIE.lock().unwrap() = None;
             if let Some(req) = ACTIVE_REQUEST.lock().unwrap().take() {
-                println!("ACTIVE_REQUEST still present, sending Cancelled to tx_result");
+                log::info!("ACTIVE_REQUEST still present, sending Cancelled to tx_result");
                 let _ = req.tx_result.send(Err("Authentication cancelled".to_string()));
             } else {
-                println!("ACTIVE_REQUEST was already taken (success/done).");
+                log::info!("ACTIVE_REQUEST was already taken (success/done).");
             }
-            println!("Waiting for next rx_gui_req...");
+            log::info!("Waiting for next rx_gui_req...");
         }
     }
 }

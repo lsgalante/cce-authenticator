@@ -5,7 +5,7 @@ build:
 
 install: build
 	mkdir -p ~/.local/bin
-	install -m 755 target/release/cce-authenticator ~/.local/bin/cce-authenticator
+	install -m 755 ../target/release/cce-authenticator ~/.local/bin/cce-authenticator
 
 run:
 	cargo run
