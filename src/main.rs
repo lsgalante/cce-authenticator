@@ -94,7 +94,7 @@ impl Application for AuthenticatorApp {
     }
 
     fn new(_qh: &QueueHandle<EngineState<Self>>, sender: calloop::channel::Sender<Self::Message>) -> Self {
-        let font_system = FontSystem::new();
+        let font_system = cce_ui::create_font_system_with_system_fonts();
         let bg = ContentBg::new();
         
         let password_box = TextBox::new(String::new())
