@@ -57,9 +57,9 @@ struct AuthenticatorApp {
     font_system: FontSystem,
     bg: ContentBg,
     password_box: TextBox,
-    verify_btn: Button,
-    cancel_btn: Button,
-    fingerprint_btn: Button,
+    verify_btn: cce_ui::widget::Adapted<cce_ui::widget::Button>,
+    cancel_btn: cce_ui::widget::Adapted<cce_ui::widget::Button>,
+    fingerprint_btn: cce_ui::widget::Adapted<cce_ui::widget::Button>,
     
     status_msg: String,
     status_is_error: bool,
