@@ -56,7 +56,7 @@ static ACTIVE_COOKIE: Mutex<Option<String>> = Mutex::new(None);
 struct AuthenticatorApp {
     font_system: FontSystem,
     bg: cce_ui::widget::Adapted<ContentBg>,
-    password_box: TextBox,
+    password_box: cce_ui::widget::Adapted<TextBox>,
     verify_btn: cce_ui::widget::Adapted<cce_ui::widget::Button>,
     cancel_btn: cce_ui::widget::Adapted<cce_ui::widget::Button>,
     fingerprint_btn: cce_ui::widget::Adapted<cce_ui::widget::Button>,
