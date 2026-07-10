@@ -2,9 +2,8 @@ use wayland_client::QueueHandle;
 use cce_ui::engine::{Application, EngineState, LogicalPosition, LogicalSize, WindowSettings};
 use cce_ui::widget::{
     Button, ContentBg, Element, ElementState, MouseButton, Key, NamedKey, KeyEvent, TextBox,
-    TextItem, MouseScrollDelta
+    MouseScrollDelta
 };
-use glyphon::{Attrs, Buffer, FontSystem, Metrics};
 use futures::StreamExt;
 use std::sync::{Arc, Mutex};
 use std::io::Write;
@@ -14,15 +13,6 @@ use std::ops::Deref;
 const ACCENT: [f32; 4] = [0.30, 0.50, 0.32, 1.0];
 const TOGGLE_OFF: [f32; 4] = [0.16, 0.16, 0.24, 1.0];
 
-fn make_text_buffer(fs: &mut FontSystem, text: &str, size: f32) -> Buffer {
-    let scale = cce_ui::scale::scale_factor();
-    let physical_size = size * scale;
-    let metrics = Metrics::new(physical_size, physical_size * 1.4);
-    let mut buf = Buffer::new(fs, metrics);
-    buf.set_text(fs, text, Attrs::new(), glyphon::Shaping::Advanced);
-    buf.shape_until_scroll(fs, true);
-    buf
-}
 
 #[derive(Clone, Debug)]
 enum AuthResult {
@@ -54,7 +44,6 @@ static ACTIVE_SENDER: Mutex<Option<calloop::channel::Sender<AppMessage>>> = Mute
 static ACTIVE_COOKIE: Mutex<Option<String>> = Mutex::new(None);
 
 struct AuthenticatorApp {
-    font_system: FontSystem,
     bg: cce_ui::widget::Adapted<ContentBg>,
     password_box: cce_ui::widget::Adapted<TextBox>,
     verify_btn: cce_ui::widget::Adapted<cce_ui::widget::Button>,
@@ -72,7 +61,6 @@ struct AuthenticatorApp {
     rx_auth: std::sync::mpsc::Receiver<AuthResult>,
     tx_auth: std::sync::mpsc::Sender<AuthResult>,
     
-    text_items: Vec<TextItem>,
     width: f32,
     height: f32,
     
@@ -94,7 +82,6 @@ impl Application for AuthenticatorApp {
     }
 
     fn new(_qh: &QueueHandle<EngineState<Self>>, sender: calloop::channel::Sender<Self::Message>) -> Self {
-        let font_system = cce_ui::create_font_system_with_system_fonts();
         let bg = ContentBg::new();
         
         let password_box = TextBox::new(String::new())
@@ -191,7 +178,6 @@ impl Application for AuthenticatorApp {
         *ACTIVE_SENDER.lock().unwrap() = Some(sender.clone());
         
         let mut app = Self {
-            font_system,
             bg,
             password_box,
             verify_btn,
@@ -209,7 +195,6 @@ impl Application for AuthenticatorApp {
             rx_auth,
             tx_auth,
             
-            text_items: Vec::new(),
             width: 800.0,
             height: 600.0,
             
@@ -414,38 +399,49 @@ impl Application for AuthenticatorApp {
         }
     }
 
-    fn view(&mut self, quads: &mut Vec<(f32, f32, f32, f32, [f32; 4])>, size: LogicalSize, scale: f64) {
+    fn display_list(&mut self, size: LogicalSize, scale: f64) -> Option<cce_ui::scene::paint::DisplayList> {
+        // Phase 6ag single paint path: the whole frame — card, columns, widgets, and all
+        // text — is this one list. NOTE this migration is a FIX, not a match: the app's old
+        // FontSystem shaped buffers whose fontdb face IDs did not resolve in the engine's
+        // render FontSystem, so ALL of this dialog's text was silently invisible (the 6e
+        // class). Shaped as display-list Text prims through the engine cache, it renders.
+        use cce_ui::scene::layout::Rect;
         cce_ui::scale::set_scale_factor(scale as f32);
         let sw = size.width as f32;
         let sh = size.height as f32;
         self.width = sw;
         self.height = sh;
-        
-        quads.push((0.0, 0.0, sw, sh, [0.03, 0.03, 0.05, 0.8]));
-        
+
+        let mut pc = cce_ui::scene::paint::PaintCtx::new();
+        let quad = |pc: &mut cce_ui::scene::paint::PaintCtx, x: f32, y: f32, w: f32, h: f32, c: [f32; 4]| {
+            pc.quad(Rect { x, y, width: w, height: h }, c);
+        };
+
+        quad(&mut pc, 0.0, 0.0, sw, sh, [0.03, 0.03, 0.05, 0.8]);
+
         let card_w = 540.0f32;
         let card_h = 320.0f32;
         let card_x = (sw - card_w) / 2.0;
         let card_y = (sh - card_h) / 2.0;
-        
-        quads.push((card_x, card_y, card_w, card_h, [0.07, 0.07, 0.10, 0.95]));
-        
+
+        quad(&mut pc, card_x, card_y, card_w, card_h, [0.07, 0.07, 0.10, 0.95]);
+
         let border_color = [0.20, 0.40, 0.65, 0.6];
-        quads.push((card_x, card_y, card_w, 1.5, border_color)); 
-        quads.push((card_x, card_y + card_h - 1.5, card_w, 1.5, border_color)); 
-        quads.push((card_x, card_y, 1.5, card_h, border_color)); 
-        quads.push((card_x + card_w - 1.5, card_y, 1.5, card_h, border_color)); 
-        
+        quad(&mut pc, card_x, card_y, card_w, 1.5, border_color);
+        quad(&mut pc, card_x, card_y + card_h - 1.5, card_w, 1.5, border_color);
+        quad(&mut pc, card_x, card_y, 1.5, card_h, border_color);
+        quad(&mut pc, card_x + card_w - 1.5, card_y, 1.5, card_h, border_color);
+
         let fp_col_x = card_x + 30.0;
         let fp_col_y = card_y + 80.0;
         let fp_col_w = 220.0;
-        
+
         let fp_btn_w = 120.0f32;
         let fp_btn_h = 120.0f32;
         let fp_btn_x = fp_col_x + (fp_col_w - fp_btn_w) / 2.0;
         let fp_btn_y = fp_col_y + 10.0;
         self.fingerprint_btn.set_rect(fp_btn_x, fp_btn_y, fp_btn_w, fp_btn_h);
-        
+
         let fp_bg = if self.fingerprint_success {
             ACCENT
         } else if self.fingerprint_active {
@@ -454,99 +450,80 @@ impl Application for AuthenticatorApp {
         } else {
             TOGGLE_OFF
         };
-        quads.push((fp_btn_x, fp_btn_y, fp_btn_w, fp_btn_h, fp_bg));
-        
+        quad(&mut pc, fp_btn_x, fp_btn_y, fp_btn_w, fp_btn_h, fp_bg);
+
         if self.fingerprint_active {
             let scan_y = fp_btn_y + 10.0 + (50.0 + 50.0 * self.glow_timer.sin()).clamp(0.0, fp_btn_h - 20.0);
-            quads.push((fp_btn_x + 10.0, scan_y, fp_btn_w - 20.0, 2.0, [0.30, 0.90, 0.32, 0.8]));
+            quad(&mut pc, fp_btn_x + 10.0, scan_y, fp_btn_w - 20.0, 2.0, [0.30, 0.90, 0.32, 0.8]);
         }
-        
+
         let pw_col_x = card_x + 290.0;
         let pw_col_y = card_y + 80.0;
         let pw_col_w = 220.0;
-        
+
         self.password_box.set_rect(pw_col_x, pw_col_y + 20.0, pw_col_w, 36.0);
-        
+
         let btn_w = 100.0f32;
         let btn_h = 32.0f32;
         let verify_x = pw_col_x;
         let cancel_x = pw_col_x + pw_col_w - btn_w;
-        
+
         self.verify_btn.set_rect(verify_x, pw_col_y + 80.0, btn_w, btn_h);
         self.cancel_btn.set_rect(cancel_x, pw_col_y + 80.0, btn_w, btn_h);
-        
+
         for w in &self.widgets_iter() {
-            quads.push((w.rect().0, w.rect().1, w.rect().2, w.rect().3, w.color()));
-            quads.extend(w.extra_quads());
+            let (wx, wy, ww, wh) = w.rect();
+            quad(&mut pc, wx, wy, ww, wh, w.color());
+            for (qx, qy, qw, qh, qc) in w.extra_quads() {
+                quad(&mut pc, qx, qy, qw, qh, qc);
+            }
         }
-        
-        self.text_items.clear();
-        
-        self.text_items.push(TextItem {
-            buffer: make_text_buffer(&mut self.font_system, "CCE AUTHENTICATOR", 15.0),
-            x: card_x + 30.0,
-            y: card_y + 30.0,
-            color: glyphon::Color::rgb(0xee, 0xee, 0xf5),
-            bounds: None,
-        });
-        
-        self.text_items.push(TextItem {
-            buffer: make_text_buffer(&mut self.font_system, "FINGERPRINT AUTHENTICATION", 10.0),
-            x: fp_col_x,
-            y: fp_col_y - 15.0,
-            color: glyphon::Color::rgb(0x83, 0x83, 0x8a),
-            bounds: None,
-        });
-        
-        self.text_items.push(TextItem {
-            buffer: make_text_buffer(&mut self.font_system, &self.fingerprint_msg, 9.0),
-            x: fp_col_x,
-            y: fp_btn_y + fp_btn_h + 12.0,
-            color: if self.fingerprint_success { glyphon::Color::rgb(0xa0, 0xee, 0xa0) } else { glyphon::Color::rgb(0xbb, 0xbb, 0xbf) },
-            bounds: Some([fp_col_x, fp_btn_y + fp_btn_h + 12.0, fp_col_x + fp_col_w, fp_btn_y + fp_btn_h + 50.0]),
-        });
-        
-        self.text_items.push(TextItem {
-            buffer: make_text_buffer(&mut self.font_system, "PASSWORD AUTHENTICATION", 10.0),
-            x: pw_col_x,
-            y: pw_col_y - 15.0,
-            color: glyphon::Color::rgb(0x83, 0x83, 0x8a),
-            bounds: None,
-        });
-        
+
+        // ── Text (the old text_items assembly, now prims shaped by the engine) ──
+        pc.text_with("CCE AUTHENTICATOR".to_string(), card_x + 30.0, card_y + 30.0, 15.0, [0xee, 0xee, 0xf5], None, None);
+        pc.text_with("FINGERPRINT AUTHENTICATION".to_string(), fp_col_x, fp_col_y - 15.0, 10.0, [0x83, 0x83, 0x8a], None, None);
+        let fp_msg_color = if self.fingerprint_success { [0xa0, 0xee, 0xa0] } else { [0xbb, 0xbb, 0xbf] };
+        pc.text_with(
+            self.fingerprint_msg.clone(),
+            fp_col_x,
+            fp_btn_y + fp_btn_h + 12.0,
+            9.0,
+            fp_msg_color,
+            None,
+            Some([fp_col_x, fp_btn_y + fp_btn_h + 12.0, fp_col_x + fp_col_w, fp_btn_y + fp_btn_h + 50.0]),
+        );
+        pc.text_with("PASSWORD AUTHENTICATION".to_string(), pw_col_x, pw_col_y - 15.0, 10.0, [0x83, 0x83, 0x8a], None, None);
+
         let mut labels = Vec::new();
         for w in &self.widgets_iter() {
             labels.extend(w.text_labels());
         }
         for label in labels {
-            self.text_items.push(TextItem {
-                buffer: make_text_buffer(&mut self.font_system, &label.text, label.font_size),
-                x: label.x,
-                y: label.y,
-                color: glyphon::Color::rgb(label.color[0], label.color[1], label.color[2]),
-                bounds: None,
-            });
+            pc.text_with(label.text, label.x, label.y, label.font_size, label.color, None, None);
         }
-        
+
         let status_color = if self.status_is_success {
-            glyphon::Color::rgb(0xa0, 0xee, 0xa0)
+            [0xa0, 0xee, 0xa0]
         } else if self.status_is_error {
-            glyphon::Color::rgb(0xee, 0x5c, 0x5c)
+            [0xee, 0x5c, 0x5c]
         } else {
-            glyphon::Color::rgb(0xbb, 0xbb, 0xbf)
+            [0xbb, 0xbb, 0xbf]
         };
-        
-        self.text_items.push(TextItem {
-            buffer: make_text_buffer(&mut self.font_system, &self.status_msg, 10.0),
-            x: card_x + 30.0,
-            y: card_y + card_h - 40.0,
-            color: status_color,
-            bounds: Some([card_x + 30.0, card_y + card_h - 45.0, card_x + card_w - 30.0, card_y + card_h - 5.0]),
-        });
+        pc.text_with(
+            self.status_msg.clone(),
+            card_x + 30.0,
+            card_y + card_h - 40.0,
+            10.0,
+            status_color,
+            None,
+            Some([card_x + 30.0, card_y + card_h - 45.0, card_x + card_w - 30.0, card_y + card_h - 5.0]),
+        );
+
+        Some(pc.finish())
     }
 
-    fn text_items(&self) -> &[TextItem] {
-        &self.text_items
+    fn display_list_text(&self) -> bool {
+        true
     }
 
     fn handle_pointer_move(&mut self, pos: LogicalPosition, needs_rebuild: &mut bool) {
