@@ -494,12 +494,8 @@ impl Application for AuthenticatorApp {
         );
         pc.text_with("PASSWORD AUTHENTICATION".to_string(), pw_col_x, pw_col_y - 15.0, 10.0, [0x83, 0x83, 0x8a], None, None);
 
-        let mut labels = Vec::new();
-        for w in &self.widgets_iter() {
-            labels.extend(w.text_labels());
-        }
-        for label in labels {
-            pc.text_with(label.text, label.x, label.y, label.font_size, label.color, None, None);
+        for w in self.widgets_iter() {
+            cce_ui::scene::painter::append_widget_text(&self.ui_context, w, &mut pc);
         }
 
         let status_color = if self.status_is_success {
