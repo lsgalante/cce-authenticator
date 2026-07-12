@@ -1,7 +1,7 @@
 use wayland_client::QueueHandle;
 use cce_ui::engine::{Application, EngineState, LogicalPosition, LogicalSize, WindowSettings};
 use cce_ui::widget::{
-    Button, ContentBg, Element, ElementState, MouseButton, Key, NamedKey, KeyEvent, TextBox,
+    Button, ContentBg, WidgetHost, ElementState, MouseButton, Key, NamedKey, KeyEvent, TextBox,
     MouseScrollDelta
 };
 use futures::StreamExt;
@@ -605,7 +605,7 @@ impl Application for AuthenticatorApp {
 }
 
 impl AuthenticatorApp {
-    fn widgets_iter(&self) -> Vec<&dyn Element> {
+    fn widgets_iter(&self) -> Vec<&dyn WidgetHost> {
         vec![
             &self.bg,
             &self.password_box,
@@ -616,7 +616,7 @@ impl AuthenticatorApp {
     }
 
     #[allow(dead_code)]
-    fn widgets_iter_mut(&mut self) -> Vec<&mut dyn Element> {
+    fn widgets_iter_mut(&mut self) -> Vec<&mut dyn WidgetHost> {
         vec![
             &mut self.bg,
             &mut self.password_box,
