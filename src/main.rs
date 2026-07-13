@@ -523,32 +523,35 @@ impl Application for AuthenticatorApp {
     }
 
     fn handle_pointer_move(&mut self, pos: LogicalPosition, needs_rebuild: &mut bool) {
+        // Routed dispatch (6bd shrink): one Event per widget root through the router.
+        let mv = cce_ui::widget::Event::PointerMove { x: pos.x, y: pos.y, local_x: pos.x, local_y: pos.y };
         let ctx = &mut self.ui_context;
-        if self.bg.cursor_moved(pos.x, pos.y, ctx) { *needs_rebuild = true; }
-        if self.password_box.cursor_moved(pos.x, pos.y, ctx) { *needs_rebuild = true; }
-        if self.verify_btn.cursor_moved(pos.x, pos.y, ctx) { *needs_rebuild = true; }
-        if self.cancel_btn.cursor_moved(pos.x, pos.y, ctx) { *needs_rebuild = true; }
-        if self.fingerprint_btn.cursor_moved(pos.x, pos.y, ctx) { *needs_rebuild = true; }
+        if ctx.propagate_event(&mv, self.bg.as_ptr_mut()) { *needs_rebuild = true; }
+        if ctx.propagate_event(&mv, self.password_box.as_ptr_mut()) { *needs_rebuild = true; }
+        if ctx.propagate_event(&mv, self.verify_btn.as_ptr_mut()) { *needs_rebuild = true; }
+        if ctx.propagate_event(&mv, self.cancel_btn.as_ptr_mut()) { *needs_rebuild = true; }
+        if ctx.propagate_event(&mv, self.fingerprint_btn.as_ptr_mut()) { *needs_rebuild = true; }
     }
 
     fn handle_mouse_input(&mut self, button: MouseButton, state: ElementState, pos: LogicalPosition, needs_rebuild: &mut bool) -> Option<Self::Message> {
         let (lx, ly) = (pos.x, pos.y);
-        
-        if self.verify_btn.mouse_input(button, state, lx, ly, &mut self.ui_context) {
+        let ev = cce_ui::widget::Event::MouseButton { button, state, x: lx, y: ly, local_x: lx, local_y: ly };
+
+        if { let ptr = self.verify_btn.as_ptr_mut(); self.ui_context.propagate_event(&ev, ptr) } {
             *needs_rebuild = true;
         }
         if self.verify_btn.take_click() {
             return Some(AppMessage::PasswordVerify);
         }
         
-        if self.cancel_btn.mouse_input(button, state, lx, ly, &mut self.ui_context) {
+        if { let ptr = self.cancel_btn.as_ptr_mut(); self.ui_context.propagate_event(&ev, ptr) } {
             *needs_rebuild = true;
         }
         if self.cancel_btn.take_click() {
             return Some(AppMessage::Cancel);
         }
         
-        if self.fingerprint_btn.mouse_input(button, state, lx, ly, &mut self.ui_context) {
+        if { let ptr = self.fingerprint_btn.as_ptr_mut(); self.ui_context.propagate_event(&ev, ptr) } {
             *needs_rebuild = true;
         }
         if self.fingerprint_btn.take_click() {
@@ -559,7 +562,7 @@ impl Application for AuthenticatorApp {
         if state == ElementState::Pressed && !tb.hit_test(lx, ly, &self.ui_context) {
             tb.unfocus();
         }
-        if tb.mouse_input(button, state, lx, ly, &mut self.ui_context) {
+        if { let ptr = tb.as_ptr_mut(); self.ui_context.propagate_event(&ev, ptr) } {
             *needs_rebuild = true;
         }
         
@@ -596,7 +599,9 @@ impl Application for AuthenticatorApp {
             }
         }
         
-        if self.password_box.keyboard_input(event, &mut self.ui_context) {
+        let kev = cce_ui::widget::Event::KeyInput(event.clone());
+        let ptr = self.password_box.as_ptr_mut();
+        if self.ui_context.propagate_event(&kev, ptr) {
             *needs_rebuild = true;
         }
         
