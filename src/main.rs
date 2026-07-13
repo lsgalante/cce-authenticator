@@ -400,6 +400,19 @@ impl Application for AuthenticatorApp {
     }
 
     fn display_list(&mut self, size: LogicalSize, scale: f64) -> Option<cce_ui::scene::paint::DisplayList> {
+        // Id-rooted router: dispatch roots resolve through the registry — keep the
+        // four roots' registrations fresh each frame (idempotent; the dialog assembles
+        // its frame by hand, so nothing else registers them).
+        {
+            let (id, ptr) = (self.verify_btn.id(), self.verify_btn.as_ptr_mut());
+            self.ui_context.register_widget(id, ptr);
+            let (id, ptr) = (self.cancel_btn.id(), self.cancel_btn.as_ptr_mut());
+            self.ui_context.register_widget(id, ptr);
+            let (id, ptr) = (self.fingerprint_btn.id(), self.fingerprint_btn.as_ptr_mut());
+            self.ui_context.register_widget(id, ptr);
+            let (id, ptr) = (self.password_box.id(), self.password_box.as_ptr_mut());
+            self.ui_context.register_widget(id, ptr);
+        }
         // Phase 6ag single paint path: the whole frame — card, columns, widgets, and all
         // text — is this one list. NOTE this migration is a FIX, not a match: the app's old
         // FontSystem shaped buffers whose fontdb face IDs did not resolve in the engine's
@@ -526,32 +539,32 @@ impl Application for AuthenticatorApp {
         // Routed dispatch (6bd shrink): one Event per widget root through the router.
         let mv = cce_ui::widget::Event::PointerMove { x: pos.x, y: pos.y, local_x: pos.x, local_y: pos.y };
         let ctx = &mut self.ui_context;
-        if ctx.propagate_event(&mv, self.bg.as_ptr_mut()) { *needs_rebuild = true; }
-        if ctx.propagate_event(&mv, self.password_box.as_ptr_mut()) { *needs_rebuild = true; }
-        if ctx.propagate_event(&mv, self.verify_btn.as_ptr_mut()) { *needs_rebuild = true; }
-        if ctx.propagate_event(&mv, self.cancel_btn.as_ptr_mut()) { *needs_rebuild = true; }
-        if ctx.propagate_event(&mv, self.fingerprint_btn.as_ptr_mut()) { *needs_rebuild = true; }
+        if ctx.propagate_event(&mv, self.bg.id()) { *needs_rebuild = true; }
+        if ctx.propagate_event(&mv, self.password_box.id()) { *needs_rebuild = true; }
+        if ctx.propagate_event(&mv, self.verify_btn.id()) { *needs_rebuild = true; }
+        if ctx.propagate_event(&mv, self.cancel_btn.id()) { *needs_rebuild = true; }
+        if ctx.propagate_event(&mv, self.fingerprint_btn.id()) { *needs_rebuild = true; }
     }
 
     fn handle_mouse_input(&mut self, button: MouseButton, state: ElementState, pos: LogicalPosition, needs_rebuild: &mut bool) -> Option<Self::Message> {
         let (lx, ly) = (pos.x, pos.y);
         let ev = cce_ui::widget::Event::MouseButton { button, state, x: lx, y: ly, local_x: lx, local_y: ly };
 
-        if { let ptr = self.verify_btn.as_ptr_mut(); self.ui_context.propagate_event(&ev, ptr) } {
+        if { let root = self.verify_btn.id(); self.ui_context.propagate_event(&ev, root) } {
             *needs_rebuild = true;
         }
         if self.verify_btn.take_click() {
             return Some(AppMessage::PasswordVerify);
         }
         
-        if { let ptr = self.cancel_btn.as_ptr_mut(); self.ui_context.propagate_event(&ev, ptr) } {
+        if { let root = self.cancel_btn.id(); self.ui_context.propagate_event(&ev, root) } {
             *needs_rebuild = true;
         }
         if self.cancel_btn.take_click() {
             return Some(AppMessage::Cancel);
         }
         
-        if { let ptr = self.fingerprint_btn.as_ptr_mut(); self.ui_context.propagate_event(&ev, ptr) } {
+        if { let root = self.fingerprint_btn.id(); self.ui_context.propagate_event(&ev, root) } {
             *needs_rebuild = true;
         }
         if self.fingerprint_btn.take_click() {
@@ -562,7 +575,7 @@ impl Application for AuthenticatorApp {
         if state == ElementState::Pressed && !tb.hit_test(lx, ly, &self.ui_context) {
             tb.unfocus();
         }
-        if { let ptr = tb.as_ptr_mut(); self.ui_context.propagate_event(&ev, ptr) } {
+        if { let root = tb.id(); self.ui_context.propagate_event(&ev, root) } {
             *needs_rebuild = true;
         }
         
@@ -600,8 +613,8 @@ impl Application for AuthenticatorApp {
         }
         
         let kev = cce_ui::widget::Event::KeyInput(event.clone());
-        let ptr = self.password_box.as_ptr_mut();
-        if self.ui_context.propagate_event(&kev, ptr) {
+        let root = self.password_box.id();
+        if self.ui_context.propagate_event(&kev, root) {
             *needs_rebuild = true;
         }
         
