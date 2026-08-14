@@ -16,8 +16,6 @@ calloop-wayland-source = "0.3.0"
 wayland-client = { version = "0.31", features = ["system"] }
 xkeysym = "0.2"
 raw-window-handle = "0.6"
-wgpu = "24"
-bytemuck = { version = "1", features = ["derive"] }
 pollster = "0.4"
 glyphon = "0.8"
 tokio = { version = "1", features = ["full"] }
