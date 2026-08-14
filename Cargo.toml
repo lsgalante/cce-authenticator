@@ -15,8 +15,6 @@ calloop = "0.13.0"
 calloop-wayland-source = "0.3.0"
 wayland-client = { version = "0.31", features = ["system"] }
 xkeysym = "0.2"
-raw-window-handle = "0.6"
-pollster = "0.4"
 glyphon = "0.8"
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
