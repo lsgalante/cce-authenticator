@@ -1,0 +1,20 @@
+[Unit]
+Description=CCE polkit authentication agent (cce-authenticator)
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+# No args = polkit-agent mode: registers on the session via D-Bus (resolving
+# the session id itself: $XDG_SESSION_ID, /proc/self/sessionid, then logind
+# GetSessionByPID) and opens a native cce-ui window per authentication
+# request, driving polkit-agent-helper-1 / PAM / fprintd. Without a session
+# agent every pkexec in the DE (settings-app sysfs writes, bluetooth power,
+# storage backup, package updates) fails silently.
+ExecStart=%h/.local/bin/cce-authenticator
+Restart=on-failure
+RestartSec=3
+Environment=RUST_LOG=info
+
+[Install]
+WantedBy=graphical-session.target
