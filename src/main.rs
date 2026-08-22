@@ -1,7 +1,7 @@
 use wayland_client::QueueHandle;
 use cce_ui::engine::{Application, EngineState, LogicalPosition, LogicalSize, WindowSettings};
 use cce_ui::widget::{
-    Button, ContentBg, WidgetHost, ElementState, MouseButton, Key, NamedKey, KeyEvent, TextBox,
+    Button, WidgetHost, ElementState, MouseButton, Key, NamedKey, KeyEvent, TextBox,
     MouseScrollDelta
 };
 use futures::StreamExt;
@@ -73,23 +73,36 @@ fn simulate_allowed(polkit_mode: bool, env_requested: bool, uid: u32) -> bool {
     !polkit_mode && (env_requested || uid == 0)
 }
 
-/// Shorten a caption to what the fingerprint column can show, breaking at a word
-/// boundary.
+/// Shorten a caption to what a column `width` logical px wide can show, breaking at
+/// a word boundary.
 ///
-/// The column is 220 logical px, and its captions are arbitrary-length strings from
-/// PAM, fprintd and D-Bus errors (`No reader: <zbus error>`). The paint API clips to a
-/// rect, and a clip rect is not a layout strategy — it cuts mid-word and gives no hint
-/// that anything is missing. There is no cheap shaping call here to measure exactly, so
-/// the budget comes from the advance observed at this size (~4.15 px/char at 9pt) and
-/// is deliberately a few characters short: erring low only moves the ellipsis earlier.
-fn fit_column(text: &str) -> String {
-    const MAX_CHARS: usize = 50;
-    if text.chars().count() <= MAX_CHARS {
+/// The fingerprint column's captions are arbitrary-length strings from PAM, fprintd
+/// and D-Bus errors (`No reader: <zbus error>`). The paint API clips to a rect, and a
+/// clip rect is not a layout strategy — it cuts mid-word and gives no hint that
+/// anything is missing. There is no cheap shaping call here to measure exactly, so the
+/// budget comes from the advance observed at this size (~4.15 px/char at 9pt) and is
+/// deliberately a few characters short: erring low only moves the ellipsis earlier.
+///
+/// The width is a parameter because the column is sized from the window — it was a
+/// hardcoded 220px back when the dialog drew a fixed-size card inside itself.
+fn fit_column(text: &str, width: f32) -> String {
+    const PX_PER_CHAR: f32 = 4.15;
+    let max_chars = ((width / PX_PER_CHAR) as usize).max(8);
+    if text.chars().count() <= max_chars {
         return text.to_string();
     }
-    let head: String = text.chars().take(MAX_CHARS - 1).collect();
+    let head: String = text.chars().take(max_chars - 1).collect();
     let cut = head.rfind(' ').unwrap_or(head.len());
     format!("{}…", head[..cut].trim_end())
+}
+
+/// A toolkit color as the `[u8; 3]` the text prims take.
+fn text_rgb(c: [f32; 4]) -> [u8; 3] {
+    [
+        (c[0] * 255.0).round().clamp(0.0, 255.0) as u8,
+        (c[1] * 255.0).round().clamp(0.0, 255.0) as u8,
+        (c[2] * 255.0).round().clamp(0.0, 255.0) as u8,
+    ]
 }
 
 /// PAM service backing the standalone password check. Polkit mode never reaches it:
@@ -123,7 +136,6 @@ fn take_cancelled(cookie: &str) -> bool {
 }
 
 struct AuthenticatorApp {
-    bg: cce_ui::widget::Adapted<ContentBg>,
     password_box: cce_ui::widget::Adapted<TextBox>,
     verify_btn: cce_ui::widget::Adapted<cce_ui::widget::Button>,
     cancel_btn: cce_ui::widget::Adapted<cce_ui::widget::Button>,
@@ -237,13 +249,11 @@ impl Application for AuthenticatorApp {
     }
 
     fn new(_qh: &QueueHandle<EngineState<Self>>, sender: calloop::channel::Sender<Self::Message>) -> Self {
-        let bg = ContentBg::new();
-        
         let password_box = TextBox::new(String::new())
             .with_password(true)
             .with_label("PASSWORD");
             
-        let verify_btn = Button::new(0.0, 0.0, 100.0, 32.0).with_label("Verify Password");
+        let verify_btn = Button::new(0.0, 0.0, 100.0, 32.0).with_label("Verify");
         let cancel_btn = Button::new(0.0, 0.0, 100.0, 32.0).with_label("Cancel");
         let mut fingerprint_btn = Button::new(0.0, 0.0, 120.0, 120.0).with_label("Scan");
         
@@ -308,7 +318,6 @@ impl Application for AuthenticatorApp {
         }
 
         let mut app = Self {
-            bg,
             password_box,
             verify_btn,
             cancel_btn,
@@ -381,9 +390,12 @@ impl Application for AuthenticatorApp {
             title: "CCE Authenticator".to_string(),
             app_id: "cce-authenticator".to_string(),
             width: 640,
-            height: 400,
+            // Sized to the content now that there is no inset card: title band,
+            // two column wells, status shelf. At 400 the wells ran ~70px past
+            // anything in them and the dialog read as half empty.
+            height: 360,
             fullscreen: false,
-            min_size: Some((580, 380)),
+            min_size: Some((560, 340)),
         }
     }
 
@@ -634,36 +646,93 @@ impl Application for AuthenticatorApp {
         self.height = sh;
 
         let mut pc = cce_ui::scene::paint::PaintCtx::new();
-        let quad = |pc: &mut cce_ui::scene::paint::PaintCtx, x: f32, y: f32, w: f32, h: f32, c: [f32; 4]| {
-            pc.quad(Rect { x, y, width: w, height: h }, c);
-        };
 
-        quad(&mut pc, 0.0, 0.0, sw, sh, [0.03, 0.03, 0.05, 0.8]);
+        // ── The window plate ──
+        //
+        // The window IS the dialog. This used to dim the whole surface and draw a
+        // fixed 540x320 "card" inside it, outlined in four 1.5px square-cornered
+        // quads — a hard blue rectangle floating 50px inside a window the compositor
+        // clips to a ~35px superellipse, with the card's fill barely separable from
+        // the scrim behind it. The plate replaces all six quads: one lit slab whose
+        // rolled perimeter reads as the physical edge the silhouette already implies.
+        //
+        // Nominal radius, NOT span-widened here: `Prim::Plate` widens its own corners
+        // (`plate_push_constants`' `scale_corners`), so pre-multiplying by
+        // `corner_span_factor` would apply it twice and detach the arc from the
+        // silhouette. It must be the SHARED backplate radius via
+        // `layout::window_corner_radius` rather than `colors::backplate_corner_radius`,
+        // which merges a per-app override the compositor never sees.
+        let mut plate_color = cce_ui::color::page_low_color();
+        if plate_color[3] > 0.001 {
+            plate_color[3] = cce_ui::color::active_backplate_opacity();
+        }
+        let wr = cce_ui::layout::window_corner_radius().max(0.0);
+        pc.plate(
+            Rect { x: 0.0, y: 0.0, width: sw, height: sh },
+            (wr, wr, wr, wr),
+            plate_color,
+            cce_ui::layout::bevel_width(),
+        );
 
-        let card_w = 540.0f32;
-        let card_h = 320.0f32;
-        let card_x = (sw - card_w) / 2.0;
-        let card_y = (sh - card_h) / 2.0;
+        // ── Layout ──
+        let pad = 24.0f32;
+        let status_h = 40.0f32;
+        let gutter = 22.0f32;
+        let caption_h = 22.0f32;
 
-        quad(&mut pc, card_x, card_y, card_w, card_h, [0.07, 0.07, 0.10, 0.95]);
+        let status_y = sh - status_h;
+        let content_y = pad + 34.0;
+        let col_w = ((sw - pad * 2.0 - gutter) / 2.0).max(140.0);
+        let fp_col_x = pad;
+        let pw_col_x = pad + col_w + gutter;
+        let well_y = content_y + caption_h;
+        let well_h = (status_y - pad * 0.5 - well_y).max(90.0);
+        let well_r = cce_ui::layout::plate_corner_radius();
+        let well_depth = cce_ui::layout::bevel_width().min(well_h * 0.2);
 
-        let border_color = [0.20, 0.40, 0.65, 0.6];
-        quad(&mut pc, card_x, card_y, card_w, 1.5, border_color);
-        quad(&mut pc, card_x, card_y + card_h - 1.5, card_w, 1.5, border_color);
-        quad(&mut pc, card_x, card_y, 1.5, card_h, border_color);
-        quad(&mut pc, card_x + card_w - 1.5, card_y, 1.5, card_h, border_color);
+        // Both columns are wells carved into the plate — the captions label a real
+        // recess instead of floating over an undifferentiated fill.
+        for x in [fp_col_x, pw_col_x] {
+            pc.recess(
+                Rect { x, y: well_y, width: col_w, height: well_h },
+                (well_r, well_r, well_r, well_r),
+                well_depth,
+            );
+        }
 
-        let fp_col_x = card_x + 30.0;
-        let fp_col_y = card_y + 80.0;
-        let fp_col_w = 220.0;
+        // The status line gets the statusbar treatment: a band carved across the foot
+        // of the plate, top wall only so the seam reads as a shelf rather than a box
+        // inset from edges the window already rounds.
+        pc.recess_edges(
+            Rect { x: 0.0, y: status_y, width: sw, height: status_h },
+            (0.0, 0.0, 0.0, 0.0),
+            cce_ui::layout::bar_wall_width(),
+            (true, false, false, false),
+        );
 
-        let fp_btn_w = 120.0f32;
-        let fp_btn_h = 120.0f32;
-        let fp_btn_x = fp_col_x + (fp_col_w - fp_btn_w) / 2.0;
-        let fp_btn_y = fp_col_y + 10.0;
+        // ── Widget geometry ──
+        //
+        // The two columns fill their wells differently because their contents differ:
+        // the reader is one target, so it centers; the password column is a form, so
+        // it runs input at the top and actions at the foot.
+        let inset = 20.0f32;
+        let cap_h = 34.0f32; // two lines at 9pt, the longest PAM/fprintd captions
+        let fp_btn_w = 150.0f32.min(col_w - inset * 2.0).min(well_h - 78.0).max(64.0);
+        let fp_btn_h = fp_btn_w;
+        let fp_btn_x = fp_col_x + (col_w - fp_btn_w) / 2.0;
+        // Target + caption ride as one block centered in the well. Top-anchored, the
+        // block left a third of the column empty under it and the column read as
+        // unfinished rather than as a target with room around it.
+        let fp_block_h = fp_btn_h + 16.0 + cap_h;
+        let fp_btn_y = well_y + ((well_h - fp_block_h) / 2.0).max(20.0);
         self.fingerprint_btn.set_rect(fp_btn_x, fp_btn_y, fp_btn_w, fp_btn_h);
 
-        let fp_bg = if self.fingerprint_success {
+        // The reader's state color rides on the widget so the plate path paints it.
+        // It used to be a quad drawn UNDER the widget loop's `quad(w.rect(), w.color())`
+        // on the identical rect — so every state (the success accent, the scanning
+        // glow, the dimmed-inert fill) was overpainted by the button's flat default
+        // and none of them ever reached the screen.
+        self.fingerprint_btn.bg = Some(if self.fingerprint_success {
             ACCENT
         } else if self.fingerprint_active {
             let alpha = 0.4 + 0.3 * self.glow_timer.sin();
@@ -674,76 +743,93 @@ impl Application for AuthenticatorApp {
             // PAM owns the reader here, and the click handler drops presses on the
             // floor — so don't paint this like something that responds to one.
             TOGGLE_INERT
-        };
-        quad(&mut pc, fp_btn_x, fp_btn_y, fp_btn_w, fp_btn_h, fp_bg);
+        });
+
+        let pw_inner_x = pw_col_x + inset;
+        let pw_inner_w = col_w - inset * 2.0;
+        self.password_box.set_rect(pw_inner_x, well_y + 40.0, pw_inner_w, 36.0);
+
+        // The two actions split the column. They were a fixed 100px, which "Verify
+        // Password" overran on both sides at the DE's 14pt control font — the label
+        // is "Verify" now, and the width follows the column instead of a constant.
+        let btn_w = ((pw_inner_w - 12.0) / 2.0).max(72.0);
+        let btn_h = 32.0f32;
+        let btn_y = well_y + well_h - 24.0 - btn_h;
+        self.verify_btn.set_rect(pw_inner_x, btn_y, btn_w, btn_h);
+        self.cancel_btn.set_rect(pw_inner_x + pw_inner_w - btn_w, btn_y, btn_w, btn_h);
+
+        // Run each control through the real paint walk, which is how every other cce
+        // app draws its widgets: the widget's own `Paint` impl, so a Button emits the
+        // sunken `inset_plate` its `raised` style means and a TextBox its recessed
+        // well, along with hover/press/focus state and its text.
+        //
+        // NOT `append_widget_plate` — that is the designer's escape hatch, and it
+        // resolves a plate through `plate_bevel()`/`solid_border()`, neither of which
+        // `Adapted` forwards from `Button`. Every control came out as a bevel filled
+        // with the configured button face, which this DE sets to #00000000: invisible.
+        for w in self.widgets_iter() {
+            cce_ui::scene::painter::paint_root_into(&self.ui_context, w, &mut pc);
+        }
 
         if self.fingerprint_active {
-            let scan_y = fp_btn_y + 10.0 + (50.0 + 50.0 * self.glow_timer.sin()).clamp(0.0, fp_btn_h - 20.0);
-            quad(&mut pc, fp_btn_x + 10.0, scan_y, fp_btn_w - 20.0, 2.0, [0.30, 0.90, 0.32, 0.8]);
+            let scan_y = fp_btn_y + 10.0
+                + (50.0 + 50.0 * self.glow_timer.sin()).clamp(0.0, fp_btn_h - 20.0);
+            pc.quad(
+                Rect { x: fp_btn_x + 10.0, y: scan_y, width: fp_btn_w - 20.0, height: 2.0 },
+                [0.30, 0.90, 0.32, 0.8],
+            );
         }
 
-        let pw_col_x = card_x + 290.0;
-        let pw_col_y = card_y + 80.0;
-        let pw_col_w = 220.0;
+        // ── Text ──
+        let caption = cce_ui::color::control_label_color_detached_u8();
+        pc.text_with(
+            "CCE AUTHENTICATOR".to_string(),
+            pad,
+            pad,
+            15.0,
+            text_rgb(cce_ui::color::TEXT_HEADER),
+            None,
+            None,
+        );
+        pc.text_with("FINGERPRINT AUTHENTICATION".to_string(), fp_col_x, content_y, 10.0, caption, None, None);
+        pc.text_with("PASSWORD AUTHENTICATION".to_string(), pw_col_x, content_y, 10.0, caption, None, None);
 
-        self.password_box.set_rect(pw_col_x, pw_col_y + 20.0, pw_col_w, 36.0);
-
-        let btn_w = 100.0f32;
-        let btn_h = 32.0f32;
-        let verify_x = pw_col_x;
-        let cancel_x = pw_col_x + pw_col_w - btn_w;
-
-        self.verify_btn.set_rect(verify_x, pw_col_y + 80.0, btn_w, btn_h);
-        self.cancel_btn.set_rect(cancel_x, pw_col_y + 80.0, btn_w, btn_h);
-
-        for w in &self.widgets_iter() {
-            let (wx, wy, ww, wh) = w.rect();
-            quad(&mut pc, wx, wy, ww, wh, w.color());
-            for (qx, qy, qw, qh, qc) in w.extra_quads() {
-                quad(&mut pc, qx, qy, qw, qh, qc);
-            }
-        }
-
-        // ── Text (the old text_items assembly, now prims shaped by the engine) ──
-        pc.text_with("CCE AUTHENTICATOR".to_string(), card_x + 30.0, card_y + 30.0, 15.0, [0xee, 0xee, 0xf5], None, None);
-        pc.text_with("FINGERPRINT AUTHENTICATION".to_string(), fp_col_x, fp_col_y - 15.0, 10.0, [0x83, 0x83, 0x8a], None, None);
         let fp_msg_color = if self.fingerprint_success {
             [0xa0, 0xee, 0xa0]
         } else if self.fingerprint_interactive || self.fingerprint_active {
-            [0xbb, 0xbb, 0xbf]
+            text_rgb(cce_ui::color::TEXT_FG)
         } else {
-            [0x83, 0x83, 0x8a]
+            caption
         };
+        let fp_msg_x = fp_col_x + inset;
+        let fp_msg_w = col_w - inset * 2.0;
+        let fp_msg_y = fp_btn_y + fp_btn_h + 16.0;
         pc.text_with(
-            fit_column(&self.fingerprint_msg),
-            fp_col_x,
-            fp_btn_y + fp_btn_h + 12.0,
+            fit_column(&self.fingerprint_msg, fp_msg_w),
+            fp_msg_x,
+            fp_msg_y,
             9.0,
             fp_msg_color,
             None,
-            Some([fp_col_x, fp_btn_y + fp_btn_h + 12.0, fp_col_x + fp_col_w, fp_btn_y + fp_btn_h + 50.0]),
+            Some([fp_msg_x, fp_msg_y, fp_msg_x + fp_msg_w, fp_msg_y + cap_h]),
         );
-        pc.text_with("PASSWORD AUTHENTICATION".to_string(), pw_col_x, pw_col_y - 15.0, 10.0, [0x83, 0x83, 0x8a], None, None);
-
-        for w in self.widgets_iter() {
-            cce_ui::scene::painter::append_widget_text(&self.ui_context, w, &mut pc);
-        }
 
         let status_color = if self.status_is_success {
             [0xa0, 0xee, 0xa0]
         } else if self.status_is_error {
             [0xee, 0x5c, 0x5c]
         } else {
-            [0xbb, 0xbb, 0xbf]
+            text_rgb(cce_ui::color::TEXT_FG)
         };
+        let status_text_y = status_y + (status_h - 12.0) / 2.0;
         pc.text_with(
             self.status_msg.clone(),
-            card_x + 30.0,
-            card_y + card_h - 40.0,
+            pad,
+            status_text_y,
             10.0,
             status_color,
             None,
-            Some([card_x + 30.0, card_y + card_h - 45.0, card_x + card_w - 30.0, card_y + card_h - 5.0]),
+            Some([pad, status_y, sw - pad, sh]),
         );
 
         Some(pc.finish())
@@ -844,24 +930,18 @@ impl Application for AuthenticatorApp {
 }
 
 impl AuthenticatorApp {
+    /// The dialog's four real controls, in paint order.
+    ///
+    /// A full-window `ContentBg` used to lead this list. It was the flat backdrop the
+    /// window plate now is, and once the widgets paint as plates it became actively
+    /// destructive: `append_widget_plate` would have drawn its fill over the plate,
+    /// erasing the lit edge and every carve under it.
     fn widgets_iter(&self) -> Vec<&dyn WidgetHost> {
         vec![
-            &self.bg,
             &self.password_box,
             &self.verify_btn,
             &self.cancel_btn,
             &self.fingerprint_btn,
-        ]
-    }
-
-    #[allow(dead_code)]
-    fn widgets_iter_mut(&mut self) -> Vec<&mut dyn WidgetHost> {
-        vec![
-            &mut self.bg,
-            &mut self.password_box,
-            &mut self.verify_btn,
-            &mut self.cancel_btn,
-            &mut self.fingerprint_btn,
         ]
     }
 }
@@ -1204,25 +1284,46 @@ mod tests {
 
     #[test]
     fn column_captions_never_cut_mid_word() {
-        // The message that exposed this: clipping rendered "…on the fingerprint read".
+        // Roughly the interior of a column in the default 640px-wide window.
+        const W: f32 = 245.0;
+
+        // The message that exposed this — clipping rendered "…on the fingerprint
+        // read" — now fits whole: the column grew from a hardcoded 220px to its
+        // share of the window. Asserted, because it is the reason the budget had
+        // to stop being a constant.
         let pam = "Place your right middle finger on the fingerprint reader";
-        let fitted = fit_column(pam);
+        assert_eq!(fit_column(pam, W), pam, "the column is wide enough for PAM's wording now");
+        assert!(fit_column(pam, 220.0).ends_with('…'), "…but not at the old width");
+
+        // The genuinely unbounded captions are the D-Bus errors.
+        let err = "No reader: org.freedesktop.DBus.Error.ServiceUnknown: \
+                   The name net.reactivated.Fprint was not provided by any .service files";
+        let fitted = fit_column(err, W);
         assert!(fitted.ends_with('…'), "long captions must show they were cut");
-        assert!(
-            !fitted.contains("read…"),
+        let kept = fitted.trim_end_matches('…');
+        assert!(err.starts_with(kept), "the kept head must be a real prefix: {fitted}");
+        // A word boundary means the character the cut dropped was a space — that is
+        // the whole difference between this and the clip rect it replaced.
+        assert_eq!(
+            err[kept.len()..].chars().next(),
+            Some(' '),
             "cut fell mid-word: {fitted}"
         );
-        assert!(pam.starts_with(fitted.trim_end_matches('…').trim_end()));
 
         // Short enough to stand as-is, ellipsis included or not.
-        assert_eq!(fit_column("Waiting for finger…"), "Waiting for finger…");
-        assert_eq!(fit_column(""), "");
+        assert_eq!(fit_column("Waiting for finger…", W), "Waiting for finger…");
+        assert_eq!(fit_column("", W), "");
 
         // No spaces to break on, and multi-byte characters: must not panic or slice
         // through a char boundary.
-        let unbroken = "x".repeat(80);
-        assert!(fit_column(&unbroken).ends_with('…'));
-        assert!(fit_column(&"é".repeat(80)).ends_with('…'));
+        let unbroken = "x".repeat(200);
+        assert!(fit_column(&unbroken, W).ends_with('…'));
+        assert!(fit_column(&"é".repeat(200), W).ends_with('…'));
+
+        // A window dragged to its minimum still has to produce something, not panic
+        // on an underflowing budget — the width is a layout value now, not a constant.
+        assert!(!fit_column(pam, 1.0).is_empty());
+        assert!(!fit_column(pam, 0.0).is_empty());
     }
 
     /// The orderings that a single active-cookie slot got wrong. One test, run in
