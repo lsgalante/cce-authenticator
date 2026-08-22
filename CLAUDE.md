@@ -72,6 +72,15 @@ request is in flight — rather than on how simulation was asked for, and the pa
 and fingerprint paths exclude it again on `polkit_mode` instead of trusting the flag.
 Keep that shape: gate on the dangerous condition, not on an allowlist of the ways in.
 
+The decision itself is `simulate_allowed`, a pure function, and `a_live_request_vetoes_simulation`
+covers its inputs exhaustively. That is deliberate, and it is the *only* way this
+invariant should be checked: verifying it live would mean setting `CCE_AUTH_SIMULATE`
+on the running agent — standing up a working authentication bypass on the machine and
+then confirming it doesn't fire. Don't. A pure function settles it without the desktop
+ever being in that state, and it is enforced on every `cargo test` instead of by
+someone remembering to repeat a manual check. The test is known to fail against the
+historical bug (`if polkit_mode { env_requested }`), which is what makes it worth having.
+
 **Cancellations are recorded for every cookie, then consumed by their owner.** Because
 requests queue, a `CancelAuthentication` can name a cookie whose window has not opened
 yet, or one that is still starting and has no `ACTIVE_SENDER` to deliver to. The

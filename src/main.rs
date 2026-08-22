@@ -59,6 +59,20 @@ static COOKIES: Mutex<CookieState> = Mutex::new(CookieState {
     cancelled: Vec::new(),
 });
 
+/// Whether the simulated authenticator may stand in for PAM.
+///
+/// Simulation reports success on its own, and in polkit mode that success is handed to
+/// polkitd as `Ok(())` — granting the privileged action with nothing checked. So a live
+/// request vetoes it outright, whatever asked for it: `CCE_AUTH_SIMULATE` once won here,
+/// which turned every pkexec in the desktop into a silent auto-yes.
+///
+/// Gate on the dangerous state, never on an allowlist of the ways in. Kept as a pure
+/// function of its inputs so the veto is settled by the test suite rather than by
+/// arranging a live authentication bypass to check it.
+fn simulate_allowed(polkit_mode: bool, env_requested: bool, uid: u32) -> bool {
+    !polkit_mode && (env_requested || uid == 0)
+}
+
 /// Shorten a caption to what the fingerprint column can show, breaking at a word
 /// boundary.
 ///
@@ -247,8 +261,11 @@ impl Application for AuthenticatorApp {
         // on how simulation was asked for: with a request present it is off, full
         // stop, whatever CCE_AUTH_SIMULATE says. The password and fingerprint paths
         // below exclude it a second time on the same condition.
-        let simulate_mode = !polkit_mode
-            && (std::env::var("CCE_AUTH_SIMULATE").is_ok() || users::get_current_uid() == 0);
+        let simulate_mode = simulate_allowed(
+            polkit_mode,
+            std::env::var("CCE_AUTH_SIMULATE").is_ok(),
+            users::get_current_uid(),
+        );
 
         let mut username = String::new();
         let mut cookie = String::new();
@@ -1160,6 +1177,29 @@ mod tests {
         let mut st = COOKIES.lock().unwrap();
         st.active = None;
         st.cancelled.retain(|c| c != cookie);
+    }
+
+    /// Exhaustive over the gate's inputs, because this is the one invariant whose
+    /// failure grants root. Checking it live would mean standing up a working
+    /// authentication bypass and confirming it doesn't fire — the test settles it
+    /// without ever putting the machine in that state.
+    #[test]
+    fn a_live_request_vetoes_simulation() {
+        for &env_requested in &[true, false] {
+            for &uid in &[0u32, 1000] {
+                assert!(
+                    !simulate_allowed(true, env_requested, uid),
+                    "polkit mode must veto simulation (env={env_requested}, uid={uid}): \
+                     a simulated success answers polkitd with Ok(()) and grants the action"
+                );
+            }
+        }
+
+        // Outside polkit mode simulation must still work, or --standalone stops being
+        // a usable test window and the veto above is untestable in practice.
+        assert!(simulate_allowed(false, true, 1000), "CCE_AUTH_SIMULATE drives standalone");
+        assert!(simulate_allowed(false, false, 0), "root standalone simulates without the var");
+        assert!(!simulate_allowed(false, false, 1000), "no request, no var, not root: real PAM");
     }
 
     #[test]
