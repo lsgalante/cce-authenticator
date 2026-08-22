@@ -91,7 +91,17 @@ and stranded dialogs. The crate's one test locks those orderings in.
 - **A real prompt is cheap and safe to raise: `pkexec true`.** Kill that client and
   polkitd sends `CancelAuthentication`, which is how the cancel path gets exercised
   end to end. `grim -g "<x>,<y> <w>x<h>"` (geometry from `ccectl windows`) captures
-  the dialog. Everything except a *successful* authentication can be verified this way.
+  the dialog.
+- **The success path is verifiable too, and `true` is the whole point of the command.**
+  Raise `pkexec true`, touch the reader, and let it through: **`pkexec`'s exit status is
+  the oracle** — 0 means `/usr/bin/true` actually ran as root, i.e. polkitd accepted the
+  agent's `Ok(())` and granted the action, which no amount of reading the agent's own
+  logs can establish. The journal should show `Sending Ok to tx_result` → `ExitWindow`
+  → `ACTIVE_REQUEST was already taken (success/done)`; that last line is the one worth
+  reading, because it proves the success path consumed the request and the main loop did
+  not then report a spurious `Cancelled` over the top of a granted authorization. This
+  costs nothing and never touches faillock — the only ingredient it needs is a human
+  finger (or password), which is why it is the one check that cannot be scripted.
 - **Do not test a failed attempt by typing a wrong password**, and never run
   `polkit-agent-helper-1` by hand. Both drive real PAM: `deny=3` / `unlock_time=600`
   in `faillock.conf` means three wrong answers lock the account for ten minutes, and
