@@ -59,6 +59,25 @@ static COOKIES: Mutex<CookieState> = Mutex::new(CookieState {
     cancelled: Vec::new(),
 });
 
+/// Shorten a caption to what the fingerprint column can show, breaking at a word
+/// boundary.
+///
+/// The column is 220 logical px, and its captions are arbitrary-length strings from
+/// PAM, fprintd and D-Bus errors (`No reader: <zbus error>`). The paint API clips to a
+/// rect, and a clip rect is not a layout strategy — it cuts mid-word and gives no hint
+/// that anything is missing. There is no cheap shaping call here to measure exactly, so
+/// the budget comes from the advance observed at this size (~4.15 px/char at 9pt) and
+/// is deliberately a few characters short: erring low only moves the ellipsis earlier.
+fn fit_column(text: &str) -> String {
+    const MAX_CHARS: usize = 50;
+    if text.chars().count() <= MAX_CHARS {
+        return text.to_string();
+    }
+    let head: String = text.chars().take(MAX_CHARS - 1).collect();
+    let cut = head.rfind(' ').unwrap_or(head.len());
+    format!("{}…", head[..cut].trim_end())
+}
+
 /// PAM service backing the standalone password check. Polkit mode never reaches it:
 /// `polkit-agent-helper-1` runs its own `polkit-1` service inside the helper process.
 const PAM_SERVICE: &str = "system-local-login";
@@ -454,8 +473,13 @@ impl Application for AuthenticatorApp {
                 self.status_is_error = is_error;
                 self.status_is_success = false;
                 if msg.to_lowercase().contains("finger") {
+                    // PAM's wording is a whole sentence naming the finger and the
+                    // reader, and the wide status line above already carries it
+                    // verbatim. Repeating it inside the narrow column printed it
+                    // twice and cut the copy mid-word ("…on the fingerprint read"),
+                    // so the column reports the state instead.
                     self.fingerprint_active = true;
-                    self.fingerprint_msg = msg;
+                    self.fingerprint_msg = "Waiting for finger…".to_string();
                 }
             }
             AppMessage::AuthDone(res) => {
@@ -666,7 +690,7 @@ impl Application for AuthenticatorApp {
             [0x83, 0x83, 0x8a]
         };
         pc.text_with(
-            self.fingerprint_msg.clone(),
+            fit_column(&self.fingerprint_msg),
             fp_col_x,
             fp_btn_y + fp_btn_h + 12.0,
             9.0,
@@ -708,7 +732,10 @@ impl Application for AuthenticatorApp {
         // Routed dispatch (6bd shrink): one Event per widget root through the router.
         let mv = cce_ui::widget::Event::PointerMove { x: pos.x, y: pos.y, local_x: pos.x, local_y: pos.y };
         let ctx = &mut self.ui_context;
-        if ctx.propagate_event(&mv, self.bg.id()) { *needs_rebuild = true; }
+        // `bg` is deliberately absent: `ContentBg::hit` is unconditionally false, so it
+        // can never consume a pointer event, and it is the one root this dialog paints
+        // without registering — routing to it logged "unregistered/stale root … event
+        // dropped" on every motion event for the life of the daemon.
         if ctx.propagate_event(&mv, self.password_box.id()) { *needs_rebuild = true; }
         if ctx.propagate_event(&mv, self.verify_btn.id()) { *needs_rebuild = true; }
         if ctx.propagate_event(&mv, self.cancel_btn.id()) { *needs_rebuild = true; }
@@ -1125,6 +1152,29 @@ mod tests {
         let mut st = COOKIES.lock().unwrap();
         st.active = None;
         st.cancelled.retain(|c| c != cookie);
+    }
+
+    #[test]
+    fn column_captions_never_cut_mid_word() {
+        // The message that exposed this: clipping rendered "…on the fingerprint read".
+        let pam = "Place your right middle finger on the fingerprint reader";
+        let fitted = fit_column(pam);
+        assert!(fitted.ends_with('…'), "long captions must show they were cut");
+        assert!(
+            !fitted.contains("read…"),
+            "cut fell mid-word: {fitted}"
+        );
+        assert!(pam.starts_with(fitted.trim_end_matches('…').trim_end()));
+
+        // Short enough to stand as-is, ellipsis included or not.
+        assert_eq!(fit_column("Waiting for finger…"), "Waiting for finger…");
+        assert_eq!(fit_column(""), "");
+
+        // No spaces to break on, and multi-byte characters: must not panic or slice
+        // through a char boundary.
+        let unbroken = "x".repeat(80);
+        assert!(fit_column(&unbroken).ends_with('…'));
+        assert!(fit_column(&"é".repeat(80)).ends_with('…'));
     }
 
     /// The orderings that a single active-cookie slot got wrong. One test, run in
