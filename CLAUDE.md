@@ -88,9 +88,28 @@ and stranded dialogs. The crate's one test locks those orderings in.
   path there (2s success, 1s exit).
 - **Never live-test `pkexec` from the shadow session** — the D-Bus *system* bus is
   shared, so the prompt lands on the real screen.
-- **Never run `polkit-agent-helper-1` by hand.** It drives real PAM: it can light up
-  the fingerprint reader and trip `pam_faillock`, which has locked this machine out
-  before. The helper and retry paths are consequently code-verified only.
+- **A real prompt is cheap and safe to raise: `pkexec true`.** Kill that client and
+  polkitd sends `CancelAuthentication`, which is how the cancel path gets exercised
+  end to end. `grim -g "<x>,<y> <w>x<h>"` (geometry from `ccectl windows`) captures
+  the dialog. Everything except a *successful* authentication can be verified this way.
+- **Do not test a failed attempt by typing a wrong password**, and never run
+  `polkit-agent-helper-1` by hand. Both drive real PAM: `deny=3` / `unlock_time=600`
+  in `faillock.conf` means three wrong answers lock the account for ten minutes, and
+  this machine has been locked out that way before. **Kill the live helper instead** —
+  the process exits non-zero exactly as a rejected password makes it, so the retry path
+  runs identically with no authentication ever attempted. Killing it three times walks
+  `RETRIES` down and should give three distinct helper pids, two `restarted helper`
+  lines, then `no attempts left` and no fourth spawn.
+- **Finding the helper defeats both usual tricks.** `polkit-agent-helper-1` is 22
+  characters, so `comm` truncates to `polkit-agent-he` and `pgrep -x` matches nothing;
+  it is setuid root, so `/proc/<pid>/exe` is unreadable and matching on the exe link
+  silently finds *no* helper while several are running. Enumerate the agent's children
+  — `/proc/$(systemctl --user show -p MainPID --value cce-polkit-agent)/task/<pid>/children`
+  — and read state from `/proc/<pid>/stat` to tell the live helper from reaped corpses.
+- **Zombie count is a standing regression check.** Cancel a few prompts and confirm no
+  child stays in state `Z`: killing a `Child` does not reap it, and taking it out of
+  the shared slot stops the reader thread from waiting on it, which leaked one zombie
+  per cancelled prompt for the life of the session until it was fixed.
 - Agent health: `systemctl --user status cce-polkit-agent`, and the journal should say
   `Successfully registered`. `RUST_LOG=info` (set by the unit) narrates every request.
 
