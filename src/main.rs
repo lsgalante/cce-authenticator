@@ -460,6 +460,14 @@ impl Application for AuthenticatorApp {
                 if let Some(ref shared_child) = self.shared_child {
                     if let Some(mut child) = shared_child.lock().unwrap().take() {
                         let _ = child.kill();
+                        // `kill` only signals — Rust never reaps on drop — and taking the
+                        // child here means the reader thread won't wait() on it either, so
+                        // without this every cancelled prompt left a zombie for the life of
+                        // the session. Reaped off-thread because this daemon must never
+                        // wedge on a wait: it is the session's only polkit agent.
+                        std::thread::spawn(move || {
+                            let _ = child.wait();
+                        });
                     }
                 }
                 *exit = true;
