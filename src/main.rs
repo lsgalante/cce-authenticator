@@ -399,6 +399,25 @@ impl Application for AuthenticatorApp {
         }
     }
 
+    /// A session modal is a utility window: two fixed columns and a status
+    /// shelf, nothing worth resizing, and nothing it should ever inherit.
+    ///
+    /// The size matters more here than for an ordinary tool. The compositor
+    /// restores a saved size per app_id over the client's request, so before
+    /// this the prompt came back at whatever it was last left at — and a
+    /// prompt is not something the user chose to open at a size, it is
+    /// something that appeared. Utility means no geometry is saved for it, so
+    /// none can be restored: every prompt is the shape this dialog asks for.
+    /// It also drops the resize affordance (the whole border band moves it)
+    /// and keeps the window out of the overview displacement.
+    ///
+    /// Placement stays the compositor's — `Window::try_center_on_view` centers
+    /// this app_id on the current view, and it is exempt from Utility's
+    /// self-sizing for position only.
+    fn utility(&self) -> bool {
+        true
+    }
+
     fn update(&mut self, msg: Self::Message, needs_rebuild: &mut bool, exit: &mut bool) {
         *needs_rebuild = true;
         match msg {
