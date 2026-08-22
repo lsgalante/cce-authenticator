@@ -12,6 +12,8 @@ use std::ops::Deref;
 
 const ACCENT: [f32; 4] = [0.30, 0.50, 0.32, 1.0];
 const TOGGLE_OFF: [f32; 4] = [0.16, 0.16, 0.24, 1.0];
+/// `TOGGLE_OFF` for a control that is not a control — see `fingerprint_interactive`.
+const TOGGLE_INERT: [f32; 4] = [0.11, 0.11, 0.15, 1.0];
 
 
 #[derive(Clone, Debug)]
@@ -57,6 +59,24 @@ static COOKIES: Mutex<CookieState> = Mutex::new(CookieState {
     cancelled: Vec::new(),
 });
 
+/// PAM service backing the standalone password check. Polkit mode never reaches it:
+/// `polkit-agent-helper-1` runs its own `polkit-1` service inside the helper process.
+const PAM_SERVICE: &str = "system-local-login";
+
+/// Who we authenticate as when nothing more specific is known.
+///
+/// The passwd database is asked first and `$USER` is only a fallback, which is the
+/// opposite of what this used to do: a user unit's environment is whatever
+/// `systemctl --user import-environment` was told to carry, so `$USER` can simply be
+/// absent here — and the old code answered that by authenticating as a login name
+/// hardcoded to this developer's machine.
+fn current_username() -> Option<String> {
+    users::get_current_username()
+        .map(|name| name.to_string_lossy().into_owned())
+        .or_else(|| std::env::var("USER").ok())
+        .filter(|name| !name.is_empty())
+}
+
 /// Consume a pending cancellation for `cookie`, reporting whether one was there.
 fn take_cancelled(cookie: &str) -> bool {
     let mut st = COOKIES.lock().unwrap();
@@ -83,6 +103,11 @@ struct AuthenticatorApp {
     fingerprint_msg: String,
     fingerprint_active: bool,
     fingerprint_success: bool,
+    /// Whether the fingerprint button does anything if pressed. In polkit mode it
+    /// does not: `pam_fprintd` inside the helper owns the reader, and whether it is
+    /// even in the stack is PAM's business, not ours — so the column stays dimmed
+    /// and unclaimed until a PAM message shows it is asking for a finger.
+    fingerprint_interactive: bool,
     
     rx_auth: std::sync::mpsc::Receiver<AuthResult>,
     tx_auth: std::sync::mpsc::Sender<AuthResult>,
@@ -187,7 +212,7 @@ impl Application for AuthenticatorApp {
             
         let verify_btn = Button::new(0.0, 0.0, 100.0, 32.0).with_label("Verify Password");
         let cancel_btn = Button::new(0.0, 0.0, 100.0, 32.0).with_label("Cancel");
-        let fingerprint_btn = Button::new(0.0, 0.0, 120.0, 120.0).with_label("Scan");
+        let mut fingerprint_btn = Button::new(0.0, 0.0, 120.0, 120.0).with_label("Scan");
         
         let (tx_auth, rx_auth) = std::sync::mpsc::channel();
         
@@ -204,11 +229,16 @@ impl Application for AuthenticatorApp {
         // stop, whatever CCE_AUTH_SIMULATE says. The password and fingerprint paths
         // below exclude it a second time on the same condition.
         let simulate_mode = !polkit_mode
-            && (std::env::var("CCE_AUTH_SIMULATE").is_ok()
-                || std::env::var("USER").unwrap_or_default() == "root");
+            && (std::env::var("CCE_AUTH_SIMULATE").is_ok() || users::get_current_uid() == 0);
 
         let mut username = String::new();
         let mut cookie = String::new();
+
+        // In polkit mode the button reports the reader rather than driving it, so it
+        // should not read as something to press.
+        if polkit_mode {
+            fingerprint_btn.set_label("Reader");
+        }
 
         if let Some(ref req) = *active_req {
             if std::env::var("CCE_AUTH_SIMULATE").is_ok() {
@@ -252,9 +282,14 @@ impl Application for AuthenticatorApp {
             status_is_error: false,
             status_is_success: false,
             
-            fingerprint_msg: "Fingerprint scanner ready".to_string(),
+            fingerprint_msg: if polkit_mode {
+                "Handled by PAM — follow the prompt".to_string()
+            } else {
+                "Fingerprint scanner ready".to_string()
+            },
             fingerprint_active: false,
             fingerprint_success: false,
+            fingerprint_interactive: !polkit_mode,
             
             rx_auth,
             tx_auth,
@@ -286,8 +321,11 @@ impl Application for AuthenticatorApp {
                 let _ = tx_clone.send(AuthResult::Success);
             });
         } else if !app.polkit_mode {
+            let Some(username) = current_username() else {
+                app.fingerprint_msg = "Cannot determine the current user".to_string();
+                return app;
+            };
             tokio::spawn(async move {
-                let username = std::env::var("USER").unwrap_or_else(|_| "lsgalante".to_string());
                 if let Err(e) = run_dbus_fingerprint(username, tx.clone()).await {
                     let _ = tx.send(AuthResult::FingerprintStatus(format!("No reader: {}", e)));
                     tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
@@ -349,7 +387,12 @@ impl Application for AuthenticatorApp {
                                 let _ = tx.send(AuthResult::Failure("Invalid password (use 'password' or empty)".to_string()));
                             }
                         } else {
-                            let username = std::env::var("USER").unwrap_or_else(|_| "lsgalante".to_string());
+                            let Some(username) = current_username() else {
+                                let _ = tx.send(AuthResult::Failure(
+                                    "Cannot determine the current user".to_string(),
+                                ));
+                                return;
+                            };
                             match tokio::task::spawn_blocking(move || run_pam_auth(&username, &password)).await {
                                 Ok(Ok(())) => {
                                     let _ = tx.send(AuthResult::Success);
@@ -382,7 +425,12 @@ impl Application for AuthenticatorApp {
                         tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
                         let _ = tx.send(AuthResult::Success);
                     } else {
-                        let username = std::env::var("USER").unwrap_or_else(|_| "lsgalante".to_string());
+                        let Some(username) = current_username() else {
+                            let _ = tx.send(AuthResult::FingerprintStatus(
+                                "Cannot determine the current user".to_string(),
+                            ));
+                            return;
+                        };
                         if let Err(e) = run_dbus_fingerprint(username, tx.clone()).await {
                             let _ = tx.send(AuthResult::FingerprintStatus(format!("Scan error: {}", e)));
                         }
@@ -571,8 +619,12 @@ impl Application for AuthenticatorApp {
         } else if self.fingerprint_active {
             let alpha = 0.4 + 0.3 * self.glow_timer.sin();
             [0.16, 0.41, 0.18, alpha]
-        } else {
+        } else if self.fingerprint_interactive {
             TOGGLE_OFF
+        } else {
+            // PAM owns the reader here, and the click handler drops presses on the
+            // floor — so don't paint this like something that responds to one.
+            TOGGLE_INERT
         };
         quad(&mut pc, fp_btn_x, fp_btn_y, fp_btn_w, fp_btn_h, fp_bg);
 
@@ -606,7 +658,13 @@ impl Application for AuthenticatorApp {
         // ── Text (the old text_items assembly, now prims shaped by the engine) ──
         pc.text_with("CCE AUTHENTICATOR".to_string(), card_x + 30.0, card_y + 30.0, 15.0, [0xee, 0xee, 0xf5], None, None);
         pc.text_with("FINGERPRINT AUTHENTICATION".to_string(), fp_col_x, fp_col_y - 15.0, 10.0, [0x83, 0x83, 0x8a], None, None);
-        let fp_msg_color = if self.fingerprint_success { [0xa0, 0xee, 0xa0] } else { [0xbb, 0xbb, 0xbf] };
+        let fp_msg_color = if self.fingerprint_success {
+            [0xa0, 0xee, 0xa0]
+        } else if self.fingerprint_interactive || self.fingerprint_active {
+            [0xbb, 0xbb, 0xbf]
+        } else {
+            [0x83, 0x83, 0x8a]
+        };
         pc.text_with(
             self.fingerprint_msg.clone(),
             fp_col_x,
@@ -758,7 +816,7 @@ impl AuthenticatorApp {
 
 fn run_pam_auth(username: &str, password: &str) -> Result<(), String> {
     unsafe {
-        let service = "system-local-login"; 
+        let service = PAM_SERVICE;
         let pass_c = std::ffi::CString::new(password).map_err(|e| e.to_string())?;
         
         extern "C" fn pam_conv_simple(
@@ -910,10 +968,18 @@ impl PolkitAgent {
                 }
             }
         }
+        // polkit names the identity it wants authenticated. If it named one we could
+        // not resolve, fall back to our own — but refuse rather than guess a name,
+        // because the wrong identity here means prompting for a password that cannot
+        // authorize the action.
         if username.is_empty() {
-            username = std::env::var("USER").unwrap_or_else(|_| "lsgalante".to_string());
+            username = current_username().ok_or_else(|| {
+                zbus::fdo::Error::Failed("no resolvable unix-user identity".to_string())
+            })?;
+            log::warn!("no unix-user identity in the request; falling back to {}", username);
         }
-        
+
+
         let (tx_result, rx_result) = tokio::sync::oneshot::channel();
         let req = GuiRequest {
             username,
