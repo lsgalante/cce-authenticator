@@ -41,7 +41,33 @@ struct GuiRequest {
 
 static ACTIVE_REQUEST: Mutex<Option<GuiRequest>> = Mutex::new(None);
 static ACTIVE_SENDER: Mutex<Option<calloop::channel::Sender<AppMessage>>> = Mutex::new(None);
-static ACTIVE_COOKIE: Mutex<Option<String>> = Mutex::new(None);
+
+/// Cancellation state for every cookie polkitd has handed us, not just the one
+/// whose window is up. Requests queue (the GUI runs on the main thread, one at a
+/// time), so a CancelAuthentication can arrive for a cookie whose window has not
+/// opened yet — or has not finished starting. A single active-cookie slot dropped
+/// both of those on the floor and stranded the dialog.
+struct CookieState {
+    active: Option<String>,
+    cancelled: Vec<String>,
+}
+
+static COOKIES: Mutex<CookieState> = Mutex::new(CookieState {
+    active: None,
+    cancelled: Vec::new(),
+});
+
+/// Consume a pending cancellation for `cookie`, reporting whether one was there.
+fn take_cancelled(cookie: &str) -> bool {
+    let mut st = COOKIES.lock().unwrap();
+    match st.cancelled.iter().position(|c| c == cookie) {
+        Some(pos) => {
+            st.cancelled.remove(pos);
+            true
+        }
+        None => false,
+    }
+}
 
 struct AuthenticatorApp {
     bg: cce_ui::widget::Adapted<ContentBg>,
@@ -70,8 +96,79 @@ struct AuthenticatorApp {
     polkit_mode: bool,
     helper_stdin: Option<std::process::ChildStdin>,
     shared_child: Option<Arc<Mutex<Option<std::process::Child>>>>,
+    /// Identity and cookie of the in-flight polkit request, kept so a failed
+    /// attempt can start a fresh helper — see `RETRIES`.
+    username: String,
+    cookie: String,
+    retries_left: u32,
     sender: calloop::channel::Sender<AppMessage>,
     ui_context: cce_ui::context::UiContext,
+}
+
+/// Extra helper runs allowed after the first attempt fails. `polkit-agent-helper-1`
+/// runs one PAM conversation and exits, so a retry means a new process; bounding the
+/// count also keeps a helper that fails *instantly* (a cookie polkitd no longer
+/// recognises) from spawning in a tight loop.
+const RETRIES: u32 = 2;
+
+/// Start `polkit-agent-helper-1` for one attempt, returning its stdin and a handle
+/// the Cancel path can kill. The reader thread translates the helper's PAM protocol
+/// into AppMessages and reports the exit status as the attempt's verdict.
+fn spawn_helper(
+    username: &str,
+    cookie: &str,
+    sender: &calloop::channel::Sender<AppMessage>,
+) -> std::io::Result<(std::process::ChildStdin, Arc<Mutex<Option<std::process::Child>>>)> {
+    let mut child = std::process::Command::new("/usr/lib/polkit-1/polkit-agent-helper-1")
+        .arg(username)
+        .arg(cookie)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::inherit())
+        .spawn()?;
+
+    let missing = |what| std::io::Error::new(std::io::ErrorKind::Other, what);
+    let stdin = child.stdin.take().ok_or_else(|| missing("helper stdin"))?;
+    let stdout = child.stdout.take().ok_or_else(|| missing("helper stdout"))?;
+
+    let child_arc = Arc::new(Mutex::new(Some(child)));
+    let reader_arc = child_arc.clone();
+    let sender = sender.clone();
+
+    std::thread::spawn(move || {
+        use std::io::BufRead;
+        let reader = std::io::BufReader::new(stdout);
+        for line in reader.lines().map_while(Result::ok) {
+            if let Some(prompt) = line.strip_prefix("PAM_PROMPT_ECHO_OFF ") {
+                let _ = sender.send(AppMessage::PromptReceived(prompt.to_string(), false));
+            } else if let Some(prompt) = line.strip_prefix("PAM_PROMPT_ECHO_ON ") {
+                let _ = sender.send(AppMessage::PromptReceived(prompt.to_string(), true));
+            } else if let Some(msg) = line.strip_prefix("PAM_ERROR_MSG ") {
+                let _ = sender.send(AppMessage::StatusReceived(msg.to_string(), true));
+            } else if let Some(msg) = line.strip_prefix("PAM_TEXT_INFO ") {
+                let _ = sender.send(AppMessage::StatusReceived(msg.to_string(), false));
+            }
+        }
+
+        // Cancel takes the child to kill it; finding None here means this attempt
+        // was abandoned deliberately and owes no verdict.
+        let mut lock = reader_arc.lock().unwrap();
+        if let Some(mut child) = lock.take() {
+            drop(lock);
+            match child.wait() {
+                Ok(status) if status.success() => {
+                    let _ = sender.send(AppMessage::AuthDone(AuthResult::Success));
+                }
+                _ => {
+                    let _ = sender.send(AppMessage::AuthDone(AuthResult::Failure(
+                        "Authentication failed".to_string(),
+                    )));
+                }
+            }
+        }
+    });
+
+    Ok((stdin, child_arc))
 }
 
 impl Application for AuthenticatorApp {
@@ -100,83 +197,50 @@ impl Application for AuthenticatorApp {
         let mut helper_stdin = None;
         let mut shared_child = None;
         let mut status_msg = "Authenticate using password or fingerprint".to_string();
-        let mut simulate_mode = std::env::var("CCE_AUTH_SIMULATE").is_ok() || 
-                             std::env::var("USER").unwrap_or_default() == "root";
-        
+        // Simulation stands in for PAM, and a simulated success answers polkitd with
+        // Ok(()) — i.e. grants the privileged action having checked no credential at
+        // all. So it is gated on the unsafe state (a real request is in flight), not
+        // on how simulation was asked for: with a request present it is off, full
+        // stop, whatever CCE_AUTH_SIMULATE says. The password and fingerprint paths
+        // below exclude it a second time on the same condition.
+        let simulate_mode = !polkit_mode
+            && (std::env::var("CCE_AUTH_SIMULATE").is_ok()
+                || std::env::var("USER").unwrap_or_default() == "root");
+
+        let mut username = String::new();
+        let mut cookie = String::new();
+
         if let Some(ref req) = *active_req {
-            status_msg = req.message.clone();
-            if std::env::var("CCE_AUTH_SIMULATE").is_err() {
-                simulate_mode = false;
+            if std::env::var("CCE_AUTH_SIMULATE").is_ok() {
+                log::warn!(
+                    "CCE_AUTH_SIMULATE is set and is being IGNORED: a real polkit request is in flight"
+                );
             }
-            
-            if !simulate_mode {
-                // Spawn polkit-agent-helper-1
-                match std::process::Command::new("/usr/lib/polkit-1/polkit-agent-helper-1")
-                    .arg(&req.username)
-                    .arg(&req.cookie)
-                    .stdin(std::process::Stdio::piped())
-                    .stdout(std::process::Stdio::piped())
-                    .stderr(std::process::Stdio::inherit())
-                    .spawn()
-                {
-                    Ok(mut child) => {
-                        let stdin = child.stdin.take();
-                        let stdout = child.stdout.take();
-                        helper_stdin = stdin;
-                        
-                        let child_arc = Arc::new(Mutex::new(Some(child)));
-                        shared_child = Some(child_arc.clone());
-                        
-                        if let Some(stdout) = stdout {
-                            let sender_clone = sender.clone();
-                            std::thread::spawn(move || {
-                                use std::io::BufRead;
-                                let reader = std::io::BufReader::new(stdout);
-                                for line in reader.lines() {
-                                    if let Ok(line) = line {
-                                        if line.starts_with("PAM_PROMPT_ECHO_OFF ") {
-                                            let prompt = line["PAM_PROMPT_ECHO_OFF ".len()..].to_string();
-                                            let _ = sender_clone.send(AppMessage::PromptReceived(prompt, false));
-                                        } else if line.starts_with("PAM_PROMPT_ECHO_ON ") {
-                                            let prompt = line["PAM_PROMPT_ECHO_ON ".len()..].to_string();
-                                            let _ = sender_clone.send(AppMessage::PromptReceived(prompt, true));
-                                        } else if line.starts_with("PAM_ERROR_MSG ") {
-                                            let msg = line["PAM_ERROR_MSG ".len()..].to_string();
-                                            let _ = sender_clone.send(AppMessage::StatusReceived(msg, true));
-                                        } else if line.starts_with("PAM_TEXT_INFO ") {
-                                            let msg = line["PAM_TEXT_INFO ".len()..].to_string();
-                                            let _ = sender_clone.send(AppMessage::StatusReceived(msg, false));
-                                        }
-                                    }
-                                }
-                                
-                                // Wait for child helper to exit
-                                let mut lock = child_arc.lock().unwrap();
-                                if let Some(mut child) = lock.take() {
-                                    drop(lock);
-                                    let exit_status = child.wait();
-                                    match exit_status {
-                                        Ok(status) if status.success() => {
-                                            let _ = sender_clone.send(AppMessage::AuthDone(AuthResult::Success));
-                                        }
-                                        _ => {
-                                            let _ = sender_clone.send(AppMessage::AuthDone(AuthResult::Failure("Authentication failed".to_string())));
-                                        }
-                                    }
-                                }
-                            });
-                        }
-                    }
-                    Err(e) => {
-                        status_msg = format!("Failed to spawn helper: {}", e);
-                    }
+            status_msg = req.message.clone();
+            username = req.username.clone();
+            cookie = req.cookie.clone();
+
+            match spawn_helper(&username, &cookie, &sender) {
+                Ok((stdin, child)) => {
+                    helper_stdin = Some(stdin);
+                    shared_child = Some(child);
+                }
+                Err(e) => {
+                    status_msg = format!("Failed to spawn helper: {}", e);
                 }
             }
         }
-        
+
         // Store active sender for Cancel D-Bus calls
         *ACTIVE_SENDER.lock().unwrap() = Some(sender.clone());
-        
+
+        // A cancel that landed while this window was starting found no sender to
+        // deliver to; claim it now that there is one.
+        if polkit_mode && take_cancelled(&cookie) {
+            log::info!("cookie {} was cancelled while its window was starting", cookie);
+            let _ = sender.send(AppMessage::Cancel);
+        }
+
         let mut app = Self {
             bg,
             password_box,
@@ -204,6 +268,9 @@ impl Application for AuthenticatorApp {
             polkit_mode,
             helper_stdin,
             shared_child,
+            username,
+            cookie,
+            retries_left: RETRIES,
             sender: sender.clone(),
             ui_context: cce_ui::context::UiContext::new(),
         };
@@ -255,11 +322,20 @@ impl Application for AuthenticatorApp {
                 self.status_msg = "Verifying password...".to_string();
                 self.status_is_error = false;
                 
-                if self.polkit_mode && !self.simulate_mode {
-                    if let Some(ref mut stdin) = self.helper_stdin {
-                        let _ = writeln!(stdin, "{}", password);
-                        let _ = stdin.flush();
-                        self.password_box.text.clear();
+                // Polkit mode answers through the helper or not at all — never through
+                // the local PAM/simulation branch, which can report success on its own.
+                if self.polkit_mode {
+                    match self.helper_stdin {
+                        Some(ref mut stdin) => {
+                            let _ = writeln!(stdin, "{}", password);
+                            let _ = stdin.flush();
+                            self.password_box.text.clear();
+                        }
+                        None => {
+                            self.status_msg =
+                                "No authentication helper — press Escape to cancel".to_string();
+                            self.status_is_error = true;
+                        }
                     }
                 } else {
                     let tx = self.tx_auth.clone();
@@ -291,7 +367,7 @@ impl Application for AuthenticatorApp {
             }
             AppMessage::FingerprintScanStart => {
                 if self.fingerprint_success || self.status_is_success { return; }
-                if self.polkit_mode && !self.simulate_mode {
+                if self.polkit_mode {
                     // PAM fprintd handles the hardware reader natively in Polkit mode
                     return;
                 }
@@ -375,10 +451,45 @@ impl Application for AuthenticatorApp {
                         log::error!("AuthResult::Failure received: {}", err);
                         self.status_is_error = true;
                         self.status_msg = err;
+
+                        // The helper has exited — it runs one PAM conversation per
+                        // process — so the stdin we still hold is a closed pipe and
+                        // Verify would write into nothing. A retry needs a fresh one.
+                        if self.polkit_mode {
+                            self.helper_stdin = None;
+                            self.shared_child = None;
+                            self.password_box.text.clear();
+
+                            if self.retries_left == 0 {
+                                log::warn!("no attempts left for cookie {}", self.cookie);
+                                self.status_msg =
+                                    format!("{} — press Escape to cancel", self.status_msg);
+                            } else {
+                                self.retries_left -= 1;
+                                match spawn_helper(&self.username, &self.cookie, &self.sender) {
+                                    Ok((stdin, child)) => {
+                                        log::info!(
+                                            "restarted helper for another attempt ({} left after this)",
+                                            self.retries_left
+                                        );
+                                        self.helper_stdin = Some(stdin);
+                                        self.shared_child = Some(child);
+                                    }
+                                    Err(e) => {
+                                        log::error!("could not restart helper: {}", e);
+                                        self.status_msg =
+                                            format!("Could not restart helper: {}", e);
+                                    }
+                                }
+                            }
+                        }
                     }
                     AuthResult::FingerprintStatus(status) => {
                         log::info!("AuthResult::FingerprintStatus received: {}", status);
-                        if status.contains("Simulation mode active") || status.contains("No reader") {
+                        if !self.polkit_mode
+                            && (status.contains("Simulation mode active")
+                                || status.contains("No reader"))
+                        {
                             self.simulate_mode = true;
                         }
                         self.fingerprint_msg = status;
@@ -811,8 +922,6 @@ impl PolkitAgent {
             tx_result,
         };
         
-        *ACTIVE_COOKIE.lock().unwrap() = Some(cookie);
-        
         self.tx_gui_req.send(req).map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
         
         match rx_result.await {
@@ -823,9 +932,21 @@ impl PolkitAgent {
     }
 
     async fn cancel_authentication(&self, cookie: String) -> zbus::fdo::Result<()> {
-        let mut active_cookie = ACTIVE_COOKIE.lock().unwrap();
-        if active_cookie.as_ref() == Some(&cookie) {
-            *active_cookie = None;
+        log::info!("cancel_authentication called for cookie {:?}", cookie);
+
+        // Record the cancellation for *any* cookie we have been handed, then try to
+        // deliver it. Whoever owns this cookie consumes the record: the main loop
+        // before opening its window, or `new()` once it has a sender. Recording
+        // unconditionally is what makes the queued and still-starting cases work.
+        let is_active = {
+            let mut st = COOKIES.lock().unwrap();
+            if !st.cancelled.iter().any(|c| c == &cookie) {
+                st.cancelled.push(cookie.clone());
+            }
+            st.active.as_deref() == Some(cookie.as_str())
+        };
+
+        if is_active {
             let sender_lock = ACTIVE_SENDER.lock().unwrap();
             if let Some(ref sender) = *sender_lock {
                 let _ = sender.send(AppMessage::Cancel);
@@ -916,6 +1037,68 @@ async fn run_polkit_agent_daemon(tx_gui_req: std::sync::mpsc::Sender<GuiRequest>
     Ok(())
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Record a cancellation the way the D-Bus handler does, reporting whether it
+    /// would have been delivered to a live window.
+    fn cancel(cookie: &str) -> bool {
+        let mut st = COOKIES.lock().unwrap();
+        if !st.cancelled.iter().any(|c| c == cookie) {
+            st.cancelled.push(cookie.to_string());
+        }
+        st.active.as_deref() == Some(cookie)
+    }
+
+    fn claim(cookie: &str) {
+        COOKIES.lock().unwrap().active = Some(cookie.to_string());
+    }
+
+    fn finish(cookie: &str) {
+        let mut st = COOKIES.lock().unwrap();
+        st.active = None;
+        st.cancelled.retain(|c| c != cookie);
+    }
+
+    /// The orderings that a single active-cookie slot got wrong. One test, run in
+    /// sequence, because COOKIES is process-global.
+    #[test]
+    fn cancellation_survives_every_ordering() {
+        // Cancel lands before the main loop claims the cookie: not deliverable, but
+        // the record is waiting when the loop looks, so the window never opens.
+        assert!(!cancel("early"));
+        claim("early");
+        assert!(take_cancelled("early"), "cancel before claim must be seen");
+        finish("early");
+
+        // Cancel lands after the claim but before the window has a sender. It reads
+        // as deliverable, yet there is nothing to deliver to — new() consumes it.
+        claim("starting");
+        assert!(cancel("starting"), "cancel for the claimed cookie is active");
+        assert!(take_cancelled("starting"), "new() must still find it");
+        finish("starting");
+
+        // Cancel for a queued cookie while another window is up. It must not be
+        // mistaken for the active one, and must survive that window closing.
+        claim("open");
+        assert!(!cancel("queued"), "a queued cookie is not the active one");
+        assert!(!take_cancelled("open"), "the open window was never cancelled");
+        finish("open");
+        claim("queued");
+        assert!(
+            take_cancelled("queued"),
+            "a queued cancel must outlive the window ahead of it"
+        );
+        finish("queued");
+
+        // Nothing left behind.
+        let st = COOKIES.lock().unwrap();
+        assert!(st.active.is_none());
+        assert!(st.cancelled.is_empty(), "cancelled cookies leaked: {:?}", st.cancelled);
+    }
+}
+
 fn main() {
     env_logger::init();
     let args: Vec<String> = std::env::args().collect();
@@ -938,14 +1121,32 @@ fn main() {
         
         while let Ok(req) = rx_gui_req.recv() {
             log::info!("rx_gui_req received a request for user: {}, message: {}", req.username, req.message);
+            let cookie = req.cookie.clone();
+
+            // Claim the cookie before checking, so a cancel racing this point either
+            // finds it active (and delivers, or is consumed by `new()`) or lands in
+            // `cancelled` in time to be seen right here. Requests wait their turn in
+            // the channel, and polkitd may well give up on one before its turn comes.
+            COOKIES.lock().unwrap().active = Some(cookie.clone());
+            if take_cancelled(&cookie) {
+                log::info!("cookie {} was cancelled before its window opened", cookie);
+                COOKIES.lock().unwrap().active = None;
+                let _ = req.tx_result.send(Err("Authentication cancelled".to_string()));
+                continue;
+            }
+
             *ACTIVE_REQUEST.lock().unwrap() = Some(req);
-            
+
             log::info!("Starting cce_ui::engine::run...");
             cce_ui::engine::run::<AuthenticatorApp>();
             log::info!("cce_ui::engine::run returned/exited!");
-            
+
             *ACTIVE_SENDER.lock().unwrap() = None;
-            *ACTIVE_COOKIE.lock().unwrap() = None;
+            {
+                let mut st = COOKIES.lock().unwrap();
+                st.active = None;
+                st.cancelled.retain(|c| c != &cookie);
+            }
             if let Some(req) = ACTIVE_REQUEST.lock().unwrap().take() {
                 log::info!("ACTIVE_REQUEST still present, sending Cancelled to tx_result");
                 let _ = req.tx_result.send(Err("Authentication cancelled".to_string()));
