@@ -685,13 +685,16 @@ impl Application for AuthenticatorApp {
         if plate_color[3] > 0.001 {
             plate_color[3] = cce_ui::color::root_plate_opacity();
         }
-        let wr = cce_ui::layout::window_corner_radius().max(0.0);
-        pc.plate(
-            Rect { x: 0.0, y: 0.0, width: sw, height: sh },
-            (wr, wr, wr, wr),
-            plate_color,
-            cce_ui::layout::bevel_width(),
-        );
+        // PlateSpec (cce-ui RFC 7b): this plate already followed the shared
+        // window radius; the spec adds the corner-span widening so the arc
+        // matches the compositor's clip exactly.
+        pc.plate_spec(&cce_ui::scene::paint::PlateSpec {
+            rect: Rect { x: 0.0, y: 0.0, width: sw, height: sh },
+            color: plate_color,
+            blur: false,
+            window_corners: (true, true, true, true),
+            depth: cce_ui::layout::bevel_width(),
+        });
 
         // ── Layout ──
         let pad = 24.0f32;
