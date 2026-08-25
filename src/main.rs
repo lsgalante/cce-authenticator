@@ -683,7 +683,7 @@ impl Application for AuthenticatorApp {
         // which merges a per-app override the compositor never sees.
         let mut plate_color = cce_ui::color::page_low_color();
         if plate_color[3] > 0.001 {
-            plate_color[3] = cce_ui::color::active_backplate_opacity();
+            plate_color[3] = cce_ui::color::root_plate_opacity();
         }
         let wr = cce_ui::layout::window_corner_radius().max(0.0);
         pc.plate(
