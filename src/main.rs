@@ -678,8 +678,8 @@ impl Application for AuthenticatorApp {
         // Nominal radius, NOT span-widened here: `Prim::Plate` widens its own corners
         // (`plate_push_constants`' `scale_corners`), so pre-multiplying by
         // `corner_span_factor` would apply it twice and detach the arc from the
-        // silhouette. It must be the SHARED backplate radius via
-        // `layout::window_corner_radius` rather than `colors::backplate_corner_radius`,
+        // silhouette. It must be the SHARED root plate radius via
+        // `layout::window_corner_radius` rather than `colors::root_plate_corner_radius`,
         // which merges a per-app override the compositor never sees.
         let mut plate_color = cce_ui::color::page_low_color();
         if plate_color[3] > 0.001 {
