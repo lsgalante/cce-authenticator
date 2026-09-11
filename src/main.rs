@@ -627,6 +627,12 @@ impl Application for AuthenticatorApp {
         }
     }
 
+    /// `tick` drains `rx_auth`, a std channel the runner cannot see; without
+    /// this the password verdict would wait for the next unrelated event.
+    fn idle_poll_interval(&self) -> Option<std::time::Duration> {
+        Some(std::time::Duration::from_millis(50))
+    }
+
     fn tick(&mut self, dt: f32, needs_rebuild: &mut bool) {
         while let Ok(res) = self.rx_auth.try_recv() {
             let _ = self.sender.send(AppMessage::AuthDone(res));
