@@ -42,7 +42,7 @@ is why the fallbacks are worth keeping.
 
 polkitd calls `BeginAuthentication` on the tokio/zbus thread; the GUI runs
 `cce_ui::engine::run` on the **main** thread, one window at a time, so requests hand
-off over an mpsc channel and **queue**. Four statics are that seam:
+off over an mpsc channel and **queue**. Three statics are that seam:
 
 - `ACTIVE_REQUEST` — the request the window being built belongs to. Its presence *is*
   polkit mode (`polkit_mode = active_req.is_some()`), and taking it is how success is
@@ -87,7 +87,8 @@ yet, or one that is still starting and has no `ACTIVE_SENDER` to deliver to. The
 handler therefore records unconditionally and *then* tries to deliver; the main loop
 claims the cookie and checks for a record before opening a window, and `new()` checks
 again once a sender exists. A single active-cookie slot got all three orderings wrong
-and stranded dialogs. The crate's one test locks those orderings in.
+and stranded dialogs. `cancellation_survives_every_ordering` locks those orderings in —
+one test covering all three, run in sequence because `COOKIES` is process-global.
 
 ## Verifying (the safe envelope is narrow)
 
