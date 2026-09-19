@@ -136,6 +136,9 @@ and stranded dialogs. The crate's one test locks those orderings in.
 
 `make install` → `ccebuild install --no-build cce-authenticator`, which installs the
 binary *and* `cce-polkit-agent.service`. Never hand-list binaries in the Makefile —
-`cargo metadata` already knows them. This directory is its own git repository with a
-fetch-only origin; committing locally is publishing, via gitsite. `Cargo.lock` is
-gitignored here, so it needs no refresh when dependencies change.
+`cargo metadata` already knows them. This directory is its own git repository whose
+`origin` is the local *bare* repo `~/git/cce-authenticator.git`, a real pushable
+remote: **committing is not publishing — `git push origin main` is**, after which
+`gitsite.timer` mirrors it to `https://git.lucas.co/cce-authenticator.git` (kept as the
+`published` remote; it is the old static mirror and never accepted a push).
+`Cargo.lock` is gitignored here, so it needs no refresh when dependencies change.
