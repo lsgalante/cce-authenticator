@@ -681,18 +681,26 @@ impl Application for AuthenticatorApp {
         pc.root_plate(sw, sh);
 
         // ── Layout ──
-        let pad = 24.0f32;
+        //
+        // Spacing comes off the toolkit's ladder, never a literal: the window
+        // inset for anything against the window edge, the root gap between the
+        // dialog's parts (the two columns, the wells and the status band), the
+        // pane rung inside each well.
+        let pad = cce_ui::layout::root_plate_inset();
         let status_h = 40.0f32;
-        let gutter = 22.0f32;
+        let gutter = cce_ui::layout::root_plate_gap();
         let caption_h = 22.0f32;
+        // TODO(style): the title row — a 15pt line plus its run down to the
+        // captions folded into one number; not a rung, so it stays a height.
+        let title_h = 34.0f32;
 
         let status_y = sh - status_h;
-        let content_y = pad + 34.0;
+        let content_y = pad + title_h;
         let col_w = ((sw - pad * 2.0 - gutter) / 2.0).max(140.0);
         let fp_col_x = pad;
         let pw_col_x = pad + col_w + gutter;
         let well_y = content_y + caption_h;
-        let well_h = (status_y - pad * 0.5 - well_y).max(90.0);
+        let well_h = (status_y - gutter - well_y).max(90.0);
         let well_r = cce_ui::layout::plate_corner_radius();
         let well_depth = cce_ui::layout::bevel_width().min(well_h * 0.2);
 
@@ -721,16 +729,22 @@ impl Application for AuthenticatorApp {
         // The two columns fill their wells differently because their contents differ:
         // the reader is one target, so it centers; the password column is a form, so
         // it runs input at the top and actions at the foot.
-        let inset = 20.0f32;
+        // Each well is the dialog's pane: its rim-to-content inset and the gap
+        // between the things inside it are the pane rung.
+        let inset = cce_ui::layout::plate_padding();
+        let gap = cce_ui::layout::plate_gap();
         let cap_h = 34.0f32; // two lines at 9pt, the longest PAM/fprintd captions
+        // TODO(style): 78 is the vertical room the caption block reserves under
+        // the reader (gap + cap_h + slack), pinned as one number when the reader
+        // was sized; a size, not a rung.
         let fp_btn_w = 150.0f32.min(col_w - inset * 2.0).min(well_h - 78.0).max(64.0);
         let fp_btn_h = fp_btn_w;
         let fp_btn_x = fp_col_x + (col_w - fp_btn_w) / 2.0;
         // Target + caption ride as one block centered in the well. Top-anchored, the
         // block left a third of the column empty under it and the column read as
         // unfinished rather than as a target with room around it.
-        let fp_block_h = fp_btn_h + 16.0 + cap_h;
-        let fp_btn_y = well_y + ((well_h - fp_block_h) / 2.0).max(20.0);
+        let fp_block_h = fp_btn_h + gap + cap_h;
+        let fp_btn_y = well_y + ((well_h - fp_block_h) / 2.0).max(inset);
         self.fingerprint_btn.set_rect(fp_btn_x, fp_btn_y, fp_btn_w, fp_btn_h);
 
         // The reader's state color rides on the widget so the plate path paints it.
@@ -753,14 +767,16 @@ impl Application for AuthenticatorApp {
 
         let pw_inner_x = pw_col_x + inset;
         let pw_inner_w = col_w - inset * 2.0;
+        // TODO(style): 40 places the entry below the well's top lip — more than
+        // the pane inset, less than a control gap; a placement, not a rung.
         self.password_box.set_rect(pw_inner_x, well_y + 40.0, pw_inner_w, 36.0);
 
         // The two actions split the column. They were a fixed 100px, which "Verify
         // Password" overran on both sides at the DE's 14pt control font — the label
         // is "Verify" now, and the width follows the column instead of a constant.
-        let btn_w = ((pw_inner_w - 12.0) / 2.0).max(72.0);
+        let btn_w = ((pw_inner_w - gap) / 2.0).max(72.0);
         let btn_h = 32.0f32;
-        let btn_y = well_y + well_h - 24.0 - btn_h;
+        let btn_y = well_y + well_h - inset - btn_h;
         self.verify_btn.set_rect(pw_inner_x, btn_y, btn_w, btn_h);
         self.cancel_btn.set_rect(pw_inner_x + pw_inner_w - btn_w, btn_y, btn_w, btn_h);
 
@@ -778,6 +794,8 @@ impl Application for AuthenticatorApp {
         }
 
         if self.fingerprint_active {
+            // style: deliberate — the scan line's 10px stand-off inside the
+            // reader target is the glyph's own geometry, not a layout gap.
             let scan_y = fp_btn_y + 10.0
                 + (50.0 + 50.0 * self.glow_timer.sin()).clamp(0.0, fp_btn_h - 20.0);
             pc.quad(
@@ -809,7 +827,7 @@ impl Application for AuthenticatorApp {
         };
         let fp_msg_x = fp_col_x + inset;
         let fp_msg_w = col_w - inset * 2.0;
-        let fp_msg_y = fp_btn_y + fp_btn_h + 16.0;
+        let fp_msg_y = fp_btn_y + fp_btn_h + gap;
         pc.text_with(
             fit_column(&self.fingerprint_msg, fp_msg_w),
             fp_msg_x,
