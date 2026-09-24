@@ -674,32 +674,11 @@ impl Application for AuthenticatorApp {
 
         // ── The window plate ──
         //
-        // The window IS the dialog. This used to dim the whole surface and draw a
-        // fixed 540x320 "card" inside it, outlined in four 1.5px square-cornered
-        // quads — a hard blue rectangle floating 50px inside a window the compositor
-        // clips to a ~35px superellipse, with the card's fill barely separable from
-        // the scrim behind it. The plate replaces all six quads: one lit slab whose
-        // rolled perimeter reads as the physical edge the silhouette already implies.
-        //
-        // Nominal radius, NOT span-widened here: `Prim::Plate` widens its own corners
-        // (`plate_push_constants`' `scale_corners`), so pre-multiplying by
-        // `corner_span_factor` would apply it twice and detach the arc from the
-        // silhouette. It must be the SHARED root plate radius via
-        // `layout::window_corner_radius` rather than `colors::root_plate_corner_radius`,
-        // which merges a per-app override the compositor never sees.
-        let mut plate_color = cce_ui::color::page_low_color();
-        if plate_color[3] > 0.001 {
-            plate_color[3] = cce_ui::color::root_plate_opacity();
-        }
-        // PlateSpec (cce-ui RFC 7b): this plate already followed the shared
-        // window radius; the spec adds the corner-span widening so the arc
-        // matches the compositor's clip exactly.
-        pc.plate_spec(&cce_ui::scene::paint::PlateSpec {
-            rect: Rect { x: 0.0, y: 0.0, width: sw, height: sh },
-            material: cce_ui::scene::Material::opaque(plate_color),
-            window_corners: (true, true, true, true),
-            depth: cce_ui::layout::bevel_width(),
-        });
+        // The window IS the dialog: the standard root plate (cce-ui
+        // `PlateSpec::window`), one lit slab whose rolled perimeter reads as
+        // the physical edge the silhouette already implies. It replaced a
+        // dimmed surface with a 540x320 "card" outlined in four square quads.
+        pc.root_plate(sw, sh);
 
         // ── Layout ──
         let pad = 24.0f32;
