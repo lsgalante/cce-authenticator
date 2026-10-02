@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-cce-ui = { git = "https://github.com/lsgalante/cce-ui.git", rev = "e3ee6f4bdcb4e5adcfd86f5757e10dfd566e5b2c" }
+cce-ui = { git = "https://github.com/lsgalante/cce-ui.git", rev = "a75722fbc68bbd146b0f38005645e253df19112c" }
 # The raw PAM binding, for the standalone password check. The higher-level `pam`
 # crate was declared next to it and never called.
 pam-sys = "0.5.6"
