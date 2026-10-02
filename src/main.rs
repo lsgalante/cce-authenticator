@@ -123,6 +123,14 @@ fn current_username() -> Option<String> {
         .filter(|name| !name.is_empty())
 }
 
+/// A polkit cookie as the log shows it: its first few characters, enough to
+/// tell requests apart in a log, never the whole one-time token. Until
+/// 2026-10-02 every request's full cookie went into the journal at info.
+fn cookie_tag(cookie: &str) -> String {
+    let head: String = cookie.chars().take(6).collect();
+    if head.len() < cookie.len() { format!("{head}…") } else { head }
+}
+
 /// Consume a pending cancellation for `cookie`, reporting whether one was there.
 fn take_cancelled(cookie: &str) -> bool {
     let mut st = COOKIES.lock().unwrap();
@@ -313,7 +321,7 @@ impl Application for AuthenticatorApp {
         // A cancel that landed while this window was starting found no sender to
         // deliver to; claim it now that there is one.
         if polkit_mode && take_cancelled(&cookie) {
-            log::info!("cookie {} was cancelled while its window was starting", cookie);
+            log::info!("cookie {} was cancelled while its window was starting", cookie_tag(&cookie));
             let _ = sender.send(AppMessage::Cancel);
         }
 
@@ -589,7 +597,7 @@ impl Application for AuthenticatorApp {
                             self.password_box.text.clear();
 
                             if self.retries_left == 0 {
-                                log::warn!("no attempts left for cookie {}", self.cookie);
+                                log::warn!("no attempts left for cookie {}", cookie_tag(&self.cookie));
                                 self.status_msg =
                                     format!("{} — press Escape to cancel", self.status_msg);
                             } else {
@@ -1104,7 +1112,7 @@ impl PolkitAgent {
         cookie: String,
         identities: Vec<(String, std::collections::HashMap<String, zbus::zvariant::OwnedValue>)>,
     ) -> zbus::fdo::Result<()> {
-        log::info!("begin_authentication called! message = {:?}, cookie = {:?}", message, cookie);
+        log::info!("begin_authentication called! message = {:?}, cookie = {}", message, cookie_tag(&cookie));
         let mut username = String::new();
         if let Some((kind, details)) = identities.first() {
             if kind == "unix-user" {
@@ -1154,7 +1162,7 @@ impl PolkitAgent {
     }
 
     async fn cancel_authentication(&self, cookie: String) -> zbus::fdo::Result<()> {
-        log::info!("cancel_authentication called for cookie {:?}", cookie);
+        log::info!("cancel_authentication called for cookie {}", cookie_tag(&cookie));
 
         // Record the cancellation for *any* cookie we have been handed, then try to
         // deliver it. Whoever owns this cookie consumes the record: the main loop
@@ -1418,7 +1426,7 @@ fn main() {
             // the channel, and polkitd may well give up on one before its turn comes.
             COOKIES.lock().unwrap().active = Some(cookie.clone());
             if take_cancelled(&cookie) {
-                log::info!("cookie {} was cancelled before its window opened", cookie);
+                log::info!("cookie {} was cancelled before its window opened", cookie_tag(&cookie));
                 COOKIES.lock().unwrap().active = None;
                 let _ = req.tx_result.send(Err("Authentication cancelled".to_string()));
                 continue;
