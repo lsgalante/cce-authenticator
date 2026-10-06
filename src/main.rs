@@ -261,8 +261,9 @@ impl Application for AuthenticatorApp {
             .with_password(true)
             .with_label("PASSWORD");
             
-        let verify_btn = Button::new(0.0, 0.0, 100.0, 32.0).with_label("Verify");
-        let cancel_btn = Button::new(0.0, 0.0, 100.0, 32.0).with_label("Cancel");
+        let btn_h = cce_ui::layout::button_height();
+        let verify_btn = Button::new(0.0, 0.0, 100.0, btn_h).with_label("Verify");
+        let cancel_btn = Button::new(0.0, 0.0, 100.0, btn_h).with_label("Cancel");
         let mut fingerprint_btn = Button::new(0.0, 0.0, 120.0, 120.0).with_label("Scan");
         
         let (tx_auth, rx_auth) = std::sync::mpsc::channel();
@@ -777,13 +778,15 @@ impl Application for AuthenticatorApp {
         let pw_inner_w = col_w - inset * 2.0;
         // TODO(style): 40 places the entry below the well's top lip — more than
         // the pane inset, less than a control gap; a placement, not a rung.
-        self.password_box.set_rect(pw_inner_x, well_y + 40.0, pw_inner_w, 36.0);
+        // The rect carries the PASSWORD label's strip above the box itself.
+        let pw_box_h = cce_ui::layout::textbox_height() + self.password_box.label_strip();
+        self.password_box.set_rect(pw_inner_x, well_y + 40.0, pw_inner_w, pw_box_h);
 
         // The two actions split the column. They were a fixed 100px, which "Verify
         // Password" overran on both sides at the DE's 14pt control font — the label
         // is "Verify" now, and the width follows the column instead of a constant.
         let btn_w = ((pw_inner_w - gap) / 2.0).max(72.0);
-        let btn_h = 32.0f32;
+        let btn_h = cce_ui::layout::button_height();
         let btn_y = well_y + well_h - inset - btn_h;
         self.verify_btn.set_rect(pw_inner_x, btn_y, btn_w, btn_h);
         self.cancel_btn.set_rect(pw_inner_x + pw_inner_w - btn_w, btn_y, btn_w, btn_h);
