@@ -1404,7 +1404,14 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     let standalone = args.contains(&"--standalone".to_string()) || args.contains(&"-s".to_string());
     
-    let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+    // Two workers: the agent's D-Bus tasks are a handful of awaits, and a
+    // runtime sized to the CPU count (20 here) parked 20 threads all session
+    // for them.
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("tokio runtime");
     let _guard = rt.enter();
     
     if standalone {
