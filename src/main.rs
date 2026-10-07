@@ -658,14 +658,10 @@ impl Application for AuthenticatorApp {
         // four roots' registrations fresh each frame (idempotent; the dialog assembles
         // its frame by hand, so nothing else registers them).
         {
-            let (id, ptr) = (self.verify_btn.id(), self.verify_btn.as_ptr_mut());
-            self.ui_context.register_widget(id, ptr);
-            let (id, ptr) = (self.cancel_btn.id(), self.cancel_btn.as_ptr_mut());
-            self.ui_context.register_widget(id, ptr);
-            let (id, ptr) = (self.fingerprint_btn.id(), self.fingerprint_btn.as_ptr_mut());
-            self.ui_context.register_widget(id, ptr);
-            let (id, ptr) = (self.password_box.id(), self.password_box.as_ptr_mut());
-            self.ui_context.register_widget(id, ptr);
+            self.ui_context.register_host(&mut self.verify_btn);
+            self.ui_context.register_host(&mut self.cancel_btn);
+            self.ui_context.register_host(&mut self.fingerprint_btn);
+            self.ui_context.register_host(&mut self.password_box);
         }
         // Phase 6ag single paint path: the whole frame — card, columns, widgets, and all
         // text — is this one list. NOTE this migration is a FIX, not a match: the app's old
