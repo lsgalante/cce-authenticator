@@ -875,6 +875,14 @@ impl Application for AuthenticatorApp {
     }
 
     fn handle_pointer_move(&mut self, pos: LogicalPosition, needs_rebuild: &mut bool) {
+        // The shared context menu (the password box's) gets the pointer to itself
+        // while open: its row highlight.
+        if cce_ui::widget::context_menu::is_visible() {
+            if cce_ui::widget::context_menu::cursor_moved(pos.x, pos.y) {
+                *needs_rebuild = true;
+            }
+            return;
+        }
         // Routed dispatch (6bd shrink): one Event per widget root through the router.
         let mv = cce_ui::widget::Event::PointerMove { x: pos.x, y: pos.y, local_x: pos.x, local_y: pos.y };
         let ctx = &mut self.ui_context;
@@ -890,6 +898,18 @@ impl Application for AuthenticatorApp {
 
     fn handle_mouse_input(&mut self, button: MouseButton, state: ElementState, pos: LogicalPosition, needs_rebuild: &mut bool) -> Option<Self::Message> {
         let (lx, ly) = (pos.x, pos.y);
+
+        // The shared context menu a right-click on the password box opens takes
+        // every click while open: a row runs, a press anywhere else dismisses it.
+        // The toolkit leaves this routing to the app; without it the menu could
+        // not be closed by clicking outside it, and its rows did nothing.
+        if cce_ui::widget::context_menu::is_visible() {
+            if cce_ui::widget::context_menu::mouse_input(button, state, lx, ly, Some(&mut self.ui_context)) {
+                *needs_rebuild = true;
+            }
+            return None;
+        }
+
         let ev = cce_ui::widget::Event::MouseButton { button, state, x: lx, y: ly, local_x: lx, local_y: ly };
 
         if { let root = self.verify_btn.id(); self.ui_context.propagate_event(&ev, root) } {
