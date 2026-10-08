@@ -1,4 +1,5 @@
 use wayland_client::QueueHandle;
+use cce_ui::widget::Owned;
 use cce_ui::engine::{Application, EngineState, LogicalPosition, LogicalSize, WindowSettings};
 use cce_ui::widget::{
     Button, WidgetHost, ElementState, MouseButton, Key, NamedKey, KeyEvent, TextBox,
@@ -144,10 +145,10 @@ fn take_cancelled(cookie: &str) -> bool {
 }
 
 struct AuthenticatorApp {
-    password_box: cce_ui::widget::Adapted<TextBox>,
-    verify_btn: cce_ui::widget::Adapted<cce_ui::widget::Button>,
-    cancel_btn: cce_ui::widget::Adapted<cce_ui::widget::Button>,
-    fingerprint_btn: cce_ui::widget::Adapted<cce_ui::widget::Button>,
+    password_box: Owned<cce_ui::widget::Adapted<TextBox>>,
+    verify_btn: Owned<cce_ui::widget::Adapted<cce_ui::widget::Button>>,
+    cancel_btn: Owned<cce_ui::widget::Adapted<cce_ui::widget::Button>>,
+    fingerprint_btn: Owned<cce_ui::widget::Adapted<cce_ui::widget::Button>>,
     
     status_msg: String,
     status_is_error: bool,
@@ -327,10 +328,10 @@ impl Application for AuthenticatorApp {
         }
 
         let mut app = Self {
-            password_box,
-            verify_btn,
-            cancel_btn,
-            fingerprint_btn,
+            password_box: Owned::new(password_box),
+            verify_btn: Owned::new(verify_btn),
+            cancel_btn: Owned::new(cancel_btn),
+            fingerprint_btn: Owned::new(fingerprint_btn),
             
             status_msg,
             status_is_error: false,
