@@ -1,6 +1,5 @@
-use wayland_client::QueueHandle;
 use cce_ui::widget::Owned;
-use cce_ui::engine::{Application, EngineState, LogicalPosition, LogicalSize, WindowSettings};
+use cce_ui::engine::{Application, LogicalPosition, LogicalSize, WindowSettings};
 use cce_ui::widget::{
     Button, WidgetHost, ElementState, MouseButton, Key, NamedKey, KeyEvent, TextBox,
     MouseScrollDelta
@@ -257,7 +256,9 @@ impl Application for AuthenticatorApp {
         Some(&self.ui_context)
     }
 
-    fn new(_qh: &QueueHandle<EngineState<Self>>, sender: calloop::channel::Sender<Self::Message>) -> Self {
+    fn create(sender: cce_ui::engine::AppSender<Self::Message>) -> Self {
+        // The app keeps calloop's sender; `AppSender` converts into it.
+        let sender: calloop::channel::Sender<Self::Message> = sender.into();
         let password_box = TextBox::new(String::new())
             .with_password(true)
             .with_label("PASSWORD");
