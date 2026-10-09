@@ -1,4 +1,4 @@
-use cce_ui::widget::Owned;
+use cce_ui::widget::Handle;
 use cce_ui::engine::{Application, LogicalPosition, LogicalSize, WindowSettings};
 use cce_ui::widget::{
     Button, WidgetHost, ElementState, MouseButton, Key, NamedKey, KeyEvent, TextBox,
@@ -144,10 +144,10 @@ fn take_cancelled(cookie: &str) -> bool {
 }
 
 struct AuthenticatorApp {
-    password_box: Owned<cce_ui::widget::Adapted<TextBox>>,
-    verify_btn: Owned<cce_ui::widget::Adapted<cce_ui::widget::Button>>,
-    cancel_btn: Owned<cce_ui::widget::Adapted<cce_ui::widget::Button>>,
-    fingerprint_btn: Owned<cce_ui::widget::Adapted<cce_ui::widget::Button>>,
+    password_box: Handle<cce_ui::widget::Adapted<TextBox>>,
+    verify_btn: Handle<cce_ui::widget::Adapted<cce_ui::widget::Button>>,
+    cancel_btn: Handle<cce_ui::widget::Adapted<cce_ui::widget::Button>>,
+    fingerprint_btn: Handle<cce_ui::widget::Adapted<cce_ui::widget::Button>>,
     
     status_msg: String,
     status_is_error: bool,
@@ -328,11 +328,13 @@ impl Application for AuthenticatorApp {
             let _ = sender.send(AppMessage::Cancel);
         }
 
+        // The context owns the widgets; the app keeps their handles.
+        let mut ui_context = cce_ui::context::UiContext::new();
         let mut app = Self {
-            password_box: Owned::new(password_box),
-            verify_btn: Owned::new(verify_btn),
-            cancel_btn: Owned::new(cancel_btn),
-            fingerprint_btn: Owned::new(fingerprint_btn),
+            password_box: ui_context.insert(password_box),
+            verify_btn: ui_context.insert(verify_btn),
+            cancel_btn: ui_context.insert(cancel_btn),
+            fingerprint_btn: ui_context.insert(fingerprint_btn),
             
             status_msg,
             status_is_error: false,
@@ -363,7 +365,7 @@ impl Application for AuthenticatorApp {
             cookie,
             retries_left: RETRIES,
             sender: sender.clone(),
-            ui_context: cce_ui::context::UiContext::new(),
+            ui_context,
         };
         
         let tx = app.tx_auth.clone();
@@ -434,7 +436,7 @@ impl Application for AuthenticatorApp {
         match msg {
             AppMessage::PasswordVerify => {
                 if self.status_is_success { return; }
-                let password = self.password_box.text.clone();
+                let password = self.ui_context[self.password_box].text.clone();
                 self.status_msg = "Verifying password...".to_string();
                 self.status_is_error = false;
                 
@@ -445,7 +447,7 @@ impl Application for AuthenticatorApp {
                         Some(ref mut stdin) => {
                             let _ = writeln!(stdin, "{}", password);
                             let _ = stdin.flush();
-                            self.password_box.text.clear();
+                            self.ui_context[self.password_box].text.clear();
                         }
                         None => {
                             self.status_msg =
@@ -532,8 +534,8 @@ impl Application for AuthenticatorApp {
                 *exit = true;
             }
             AppMessage::PromptReceived(prompt, _echo) => {
-                self.password_box.set_label(&prompt);
-                self.password_box.text.clear();
+                self.ui_context[self.password_box].set_label(&prompt);
+                self.ui_context[self.password_box].text.clear();
             }
             AppMessage::StatusReceived(msg, is_error) => {
                 self.status_msg = msg.clone();
@@ -597,7 +599,7 @@ impl Application for AuthenticatorApp {
                         if self.polkit_mode {
                             self.helper_stdin = None;
                             self.shared_child = None;
-                            self.password_box.text.clear();
+                            self.ui_context[self.password_box].text.clear();
 
                             if self.retries_left == 0 {
                                 log::warn!("no attempts left for cookie {}", cookie_tag(&self.cookie));
@@ -660,10 +662,6 @@ impl Application for AuthenticatorApp {
         // four roots' registrations fresh each frame (idempotent; the dialog assembles
         // its frame by hand, so nothing else registers them).
         {
-            self.ui_context.register_host(&mut self.verify_btn);
-            self.ui_context.register_host(&mut self.cancel_btn);
-            self.ui_context.register_host(&mut self.fingerprint_btn);
-            self.ui_context.register_host(&mut self.password_box);
         }
         // Phase 6ag single paint path: the whole frame — card, columns, widgets, and all
         // text — is this one list. NOTE this migration is a FIX, not a match: the app's old
@@ -752,14 +750,14 @@ impl Application for AuthenticatorApp {
         // unfinished rather than as a target with room around it.
         let fp_block_h = fp_btn_h + gap + cap_h;
         let fp_btn_y = well_y + ((well_h - fp_block_h) / 2.0).max(inset);
-        self.fingerprint_btn.set_rect(fp_btn_x, fp_btn_y, fp_btn_w, fp_btn_h);
+        self.ui_context[self.fingerprint_btn].set_rect(fp_btn_x, fp_btn_y, fp_btn_w, fp_btn_h);
 
         // The reader's state color rides on the widget so the plate path paints it.
         // It used to be a quad drawn UNDER the widget loop's `quad(w.rect(), w.color())`
         // on the identical rect — so every state (the success accent, the scanning
         // glow, the dimmed-inert fill) was overpainted by the button's flat default
         // and none of them ever reached the screen.
-        self.fingerprint_btn.bg = Some(if self.fingerprint_success {
+        self.ui_context[self.fingerprint_btn].bg = Some(if self.fingerprint_success {
             ACCENT
         } else if self.fingerprint_active {
             let alpha = 0.4 + 0.3 * self.glow_timer.sin();
@@ -777,8 +775,8 @@ impl Application for AuthenticatorApp {
         // TODO(style): 40 places the entry below the well's top lip — more than
         // the pane inset, less than a control gap; a placement, not a rung.
         // The rect carries the PASSWORD label's strip above the box itself.
-        let pw_box_h = cce_ui::layout::textbox_height() + self.password_box.label_strip();
-        self.password_box.set_rect(pw_inner_x, well_y + 40.0, pw_inner_w, pw_box_h);
+        let pw_box_h = cce_ui::layout::textbox_height() + self.ui_context[self.password_box].label_strip();
+        self.ui_context[self.password_box].set_rect(pw_inner_x, well_y + 40.0, pw_inner_w, pw_box_h);
 
         // The two actions split the column. They were a fixed 100px, which "Verify
         // Password" overran on both sides at the DE's 14pt control font — the label
@@ -786,8 +784,8 @@ impl Application for AuthenticatorApp {
         let btn_w = ((pw_inner_w - gap) / 2.0).max(72.0);
         let btn_h = cce_ui::layout::button_height();
         let btn_y = well_y + well_h - inset - btn_h;
-        self.verify_btn.set_rect(pw_inner_x, btn_y, btn_w, btn_h);
-        self.cancel_btn.set_rect(pw_inner_x + pw_inner_w - btn_w, btn_y, btn_w, btn_h);
+        self.ui_context[self.verify_btn].set_rect(pw_inner_x, btn_y, btn_w, btn_h);
+        self.ui_context[self.cancel_btn].set_rect(pw_inner_x + pw_inner_w - btn_w, btn_y, btn_w, btn_h);
 
         // Run each control through the real paint walk, which is how every other cce
         // app draws its widgets: the widget's own `Paint` impl, so a Button emits the
@@ -913,29 +911,29 @@ impl Application for AuthenticatorApp {
         if { let root = self.verify_btn.id(); self.ui_context.propagate_event(&ev, root) } {
             *needs_rebuild = true;
         }
-        if self.verify_btn.take_click() {
+        if self.ui_context[self.verify_btn].take_click() {
             return Some(AppMessage::PasswordVerify);
         }
         
         if { let root = self.cancel_btn.id(); self.ui_context.propagate_event(&ev, root) } {
             *needs_rebuild = true;
         }
-        if self.cancel_btn.take_click() {
+        if self.ui_context[self.cancel_btn].take_click() {
             return Some(AppMessage::Cancel);
         }
         
         if { let root = self.fingerprint_btn.id(); self.ui_context.propagate_event(&ev, root) } {
             *needs_rebuild = true;
         }
-        if self.fingerprint_btn.take_click() {
+        if self.ui_context[self.fingerprint_btn].take_click() {
             return Some(AppMessage::FingerprintScanStart);
         }
         
-        let tb = &mut self.password_box;
-        if state == ElementState::Pressed && !tb.hit_test(lx, ly, &self.ui_context) {
-            tb.unfocus();
+        let hit = self.ui_context[self.password_box].hit_test(lx, ly, &self.ui_context);
+        if state == ElementState::Pressed && !hit {
+            self.ui_context[self.password_box].unfocus();
         }
-        if { let root = tb.id(); self.ui_context.propagate_event(&ev, root) } {
+        if self.ui_context.propagate_event(&ev, self.password_box.id()) {
             *needs_rebuild = true;
         }
         
@@ -947,15 +945,15 @@ impl Application for AuthenticatorApp {
     fn handle_key_input(&mut self, event: &KeyEvent, needs_rebuild: &mut bool) -> Option<Self::Message> {
         if event.state == ElementState::Pressed && !event.repeat {
             if let Key::Named(NamedKey::Tab) = event.logical_key {
-                if self.password_box.focused(&self.ui_context) {
-                    self.password_box.unfocus();
-                    self.verify_btn.focus();
-                } else if self.verify_btn.focused(&self.ui_context) {
-                    self.verify_btn.unfocus();
-                    self.cancel_btn.focus();
+                if self.ui_context[self.password_box].focused(&self.ui_context) {
+                    self.ui_context[self.password_box].unfocus();
+                    self.ui_context[self.verify_btn].focus();
+                } else if self.ui_context[self.verify_btn].focused(&self.ui_context) {
+                    self.ui_context[self.verify_btn].unfocus();
+                    self.ui_context[self.cancel_btn].focus();
                 } else {
-                    self.cancel_btn.unfocus();
-                    self.password_box.focus();
+                    self.ui_context[self.cancel_btn].unfocus();
+                    self.ui_context[self.password_box].focus();
                 }
                 *needs_rebuild = true;
                 return None;
@@ -966,7 +964,7 @@ impl Application for AuthenticatorApp {
             }
             
             if let Key::Named(NamedKey::Enter) = event.logical_key {
-                if self.password_box.focused(&self.ui_context) {
+                if self.ui_context[self.password_box].focused(&self.ui_context) {
                     return Some(AppMessage::PasswordVerify);
                 }
             }
@@ -991,10 +989,10 @@ impl AuthenticatorApp {
     /// erasing the lit edge and every carve under it.
     fn widgets_iter(&self) -> Vec<&dyn WidgetHost> {
         vec![
-            &self.password_box,
-            &self.verify_btn,
-            &self.cancel_btn,
-            &self.fingerprint_btn,
+            &self.ui_context[self.password_box],
+            &self.ui_context[self.verify_btn],
+            &self.ui_context[self.cancel_btn],
+            &self.ui_context[self.fingerprint_btn],
         ]
     }
 }
