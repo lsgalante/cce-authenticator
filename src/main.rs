@@ -797,7 +797,7 @@ impl Application for AuthenticatorApp {
         // `Adapted` forwards from `Button`. Every control came out as a bevel filled
         // with the configured button face, which this DE sets to #00000000: invisible.
         for w in self.widgets_iter() {
-            cce_ui::scene::painter::paint_root_into(&self.ui_context, w, &mut pc);
+            cce_ui::widget::painter::paint_root_into(&self.ui_context, w, &mut pc);
         }
 
         if self.fingerprint_active {
