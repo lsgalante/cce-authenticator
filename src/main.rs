@@ -2,7 +2,7 @@ use cce_ui::widget::Handle;
 use cce_ui::engine::{Application, LogicalPosition, LogicalSize, WindowSettings};
 use cce_ui::widget::{
     Button, WidgetHost, ElementState, MouseButton, Key, NamedKey, KeyEvent, TextBox,
-    MouseScrollDelta
+    MouseScrollDelta, WidgetEvent
 };
 use futures::StreamExt;
 use std::sync::{Arc, Mutex};
@@ -254,6 +254,15 @@ impl Application for AuthenticatorApp {
 
     fn ui_context(&self) -> Option<&cce_ui::context::UiContext> {
         Some(&self.ui_context)
+    }
+
+    /// The runner's Tab / Shift+Tab walk, its undo/redo routing to the focused
+    /// password box and an assistive tool's actions all go through this. It
+    /// returned `None` once, which left Tab to a hand-rolled cycle that moved
+    /// the ring but not the keyboard: Enter on a "focused" Verify still went to
+    /// the password box.
+    fn ui_context_mut(&mut self) -> Option<&mut cce_ui::context::UiContext> {
+        Some(&mut self.ui_context)
     }
 
     fn create(sender: cce_ui::engine::AppSender<Self::Message>) -> Self {
@@ -908,25 +917,15 @@ impl Application for AuthenticatorApp {
 
         let ev = cce_ui::widget::Event::MouseButton { button, state, x: lx, y: ly, local_x: lx, local_y: ly };
 
-        if { let root = self.verify_btn.id(); self.ui_context.propagate_event(&ev, root) } {
-            *needs_rebuild = true;
-        }
-        if self.ui_context[self.verify_btn].take_click() {
-            return Some(AppMessage::PasswordVerify);
-        }
-        
-        if { let root = self.cancel_btn.id(); self.ui_context.propagate_event(&ev, root) } {
-            *needs_rebuild = true;
-        }
-        if self.ui_context[self.cancel_btn].take_click() {
-            return Some(AppMessage::Cancel);
-        }
-        
-        if { let root = self.fingerprint_btn.id(); self.ui_context.propagate_event(&ev, root) } {
-            *needs_rebuild = true;
-        }
-        if self.ui_context[self.fingerprint_btn].take_click() {
-            return Some(AppMessage::FingerprintScanStart);
+        // A button that took the click ends the dispatch: the roots after it never
+        // see this press or release.
+        for root in [self.verify_btn.id(), self.cancel_btn.id(), self.fingerprint_btn.id()] {
+            if self.ui_context.propagate_event(&ev, root) {
+                *needs_rebuild = true;
+            }
+            if let Some(msg) = self.drain_widget_events() {
+                return Some(msg);
+            }
         }
         
         let hit = self.ui_context[self.password_box].hit_test(lx, ly, &self.ui_context);
@@ -937,28 +936,14 @@ impl Application for AuthenticatorApp {
             *needs_rebuild = true;
         }
         
-        None
+        self.drain_widget_events()
     }
 
     fn handle_mouse_wheel(&mut self, _delta: &MouseScrollDelta, _pos: LogicalPosition, _needs_rebuild: &mut bool) {}
 
     fn handle_key_input(&mut self, event: &KeyEvent, needs_rebuild: &mut bool) -> Option<Self::Message> {
+        // Tab never arrives here: the runner walks the focus (`ui_context_mut`).
         if event.state == ElementState::Pressed && !event.repeat {
-            if let Key::Named(NamedKey::Tab) = event.logical_key {
-                if self.ui_context[self.password_box].focused(&self.ui_context) {
-                    self.ui_context[self.password_box].unfocus();
-                    self.ui_context[self.verify_btn].focus();
-                } else if self.ui_context[self.verify_btn].focused(&self.ui_context) {
-                    self.ui_context[self.verify_btn].unfocus();
-                    self.ui_context[self.cancel_btn].focus();
-                } else {
-                    self.ui_context[self.cancel_btn].unfocus();
-                    self.ui_context[self.password_box].focus();
-                }
-                *needs_rebuild = true;
-                return None;
-            }
-            
             if let Key::Named(NamedKey::Escape) = event.logical_key {
                 return Some(AppMessage::Cancel);
             }
@@ -976,11 +961,36 @@ impl Application for AuthenticatorApp {
             *needs_rebuild = true;
         }
         
-        None
+        // Enter / Space on a focused button (or an assistive tool's click, which
+        // arrives as Space) acts now, not at the next pointer event.
+        self.drain_widget_events()
     }
 }
 
 impl AuthenticatorApp {
+    /// What the widgets reported since the last sweep, as the message the hook
+    /// returns: a click on Verify, Cancel or the reader. The only thing anything
+    /// here reports — the password box's edits are read from its text — and one
+    /// dispatch makes at most one, but a second would go through the sender
+    /// rather than be lost.
+    fn drain_widget_events(&mut self) -> Option<AppMessage> {
+        let mut first = None;
+        for (id, ev) in self.ui_context.take_events() {
+            let msg = match ev {
+                WidgetEvent::Clicked if id == self.verify_btn.id() => AppMessage::PasswordVerify,
+                WidgetEvent::Clicked if id == self.cancel_btn.id() => AppMessage::Cancel,
+                WidgetEvent::Clicked if id == self.fingerprint_btn.id() => AppMessage::FingerprintScanStart,
+                _ => continue,
+            };
+            if first.is_none() {
+                first = Some(msg);
+            } else {
+                let _ = self.sender.send(msg);
+            }
+        }
+        first
+    }
+
     /// The dialog's four real controls, in paint order.
     ///
     /// A full-window `ContentBg` used to lead this list. It was the flat backdrop the
