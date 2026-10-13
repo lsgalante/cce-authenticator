@@ -445,7 +445,7 @@ impl Application for AuthenticatorApp {
         match msg {
             AppMessage::PasswordVerify => {
                 if self.status_is_success { return; }
-                let password = self.ui_context[self.password_box].text.clone();
+                let password = self.typed_password();
                 self.status_msg = "Verifying password...".to_string();
                 self.status_is_error = false;
                 
@@ -456,7 +456,7 @@ impl Application for AuthenticatorApp {
                         Some(ref mut stdin) => {
                             let _ = writeln!(stdin, "{}", password);
                             let _ = stdin.flush();
-                            self.ui_context[self.password_box].text.clear();
+                            self.clear_password();
                         }
                         None => {
                             self.status_msg =
@@ -544,7 +544,7 @@ impl Application for AuthenticatorApp {
             }
             AppMessage::PromptReceived(prompt, _echo) => {
                 self.ui_context[self.password_box].set_label(&prompt);
-                self.ui_context[self.password_box].text.clear();
+                self.clear_password();
             }
             AppMessage::StatusReceived(msg, is_error) => {
                 self.status_msg = msg.clone();
@@ -608,7 +608,7 @@ impl Application for AuthenticatorApp {
                         if self.polkit_mode {
                             self.helper_stdin = None;
                             self.shared_child = None;
-                            self.ui_context[self.password_box].text.clear();
+                            self.clear_password();
 
                             if self.retries_left == 0 {
                                 log::warn!("no attempts left for cookie {}", cookie_tag(&self.cookie));
@@ -968,6 +968,29 @@ impl Application for AuthenticatorApp {
 }
 
 impl AuthenticatorApp {
+    /// What the password box holds right now. While it is editing, that is its
+    /// edit buffer: `text` only catches up when the box commits (a click
+    /// elsewhere, focus loss), so Enter — which `handle_key_input` takes before
+    /// the box sees it — read a stale, usually empty, `text` and submitted that.
+    fn typed_password(&self) -> String {
+        let b = &self.ui_context[self.password_box];
+        if b.editing { b.committed_buffer() } else { b.text.clone() }
+    }
+
+    /// Empty the password box, edit buffer and undo history included: clearing
+    /// `text` alone left a still-editing box showing (and resubmitting) what was
+    /// just sent, and Ctrl+Z could bring a submitted password back.
+    fn clear_password(&mut self) {
+        let b = &mut self.ui_context[self.password_box];
+        b.text.clear();
+        b.edit_buffer.clear();
+        b.cursor_idx = 0;
+        b.select_anchor = None;
+        b.all_selected = false;
+        b.history.clear();
+        b.sync_editor_state();
+    }
+
     /// What the widgets reported since the last sweep, as the message the hook
     /// returns: a click on Verify, Cancel or the reader. The only thing anything
     /// here reports — the password box's edits are read from its text — and one
