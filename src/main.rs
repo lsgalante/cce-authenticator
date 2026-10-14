@@ -12,7 +12,7 @@ use std::ops::Deref;
 
 const ACCENT: [f32; 4] = [0.30, 0.50, 0.32, 1.0];
 const TOGGLE_OFF: [f32; 4] = [0.16, 0.16, 0.24, 1.0];
-/// `TOGGLE_OFF` for a control that is not a control — see `fingerprint_interactive`.
+/// `TOGGLE_OFF` for a reader this dialog is not driving — see `drives_reader`.
 const TOGGLE_INERT: [f32; 4] = [0.11, 0.11, 0.15, 1.0];
 
 
@@ -27,7 +27,6 @@ enum AuthResult {
 #[derive(Clone, Debug)]
 enum AppMessage {
     PasswordVerify,
-    FingerprintScanStart,
     AuthDone(AuthResult),
     Cancel,
     PromptReceived(String, bool), // (prompt, echo)
@@ -150,7 +149,6 @@ struct AuthenticatorApp {
     password_box: Handle<cce_ui::widget::Adapted<TextBox>>,
     verify_btn: Handle<cce_ui::widget::Adapted<cce_ui::widget::Button>>,
     cancel_btn: Handle<cce_ui::widget::Adapted<cce_ui::widget::Button>>,
-    fingerprint_btn: Handle<cce_ui::widget::Adapted<cce_ui::widget::Button>>,
     
     status_msg: String,
     status_is_error: bool,
@@ -159,11 +157,12 @@ struct AuthenticatorApp {
     fingerprint_msg: String,
     fingerprint_active: bool,
     fingerprint_success: bool,
-    /// Whether the fingerprint button does anything if pressed. In polkit mode it
-    /// does not: `pam_fprintd` inside the helper owns the reader, and whether it is
-    /// even in the stack is PAM's business, not ours — so the column stays dimmed
-    /// and unclaimed until a PAM message shows it is asking for a finger.
-    fingerprint_interactive: bool,
+    /// Whether this dialog drives the reader itself (standalone: fprintd directly,
+    /// from the moment the window opens). In polkit mode `pam_fprintd` inside the
+    /// helper owns the reader, and whether it is even in the stack is PAM's business,
+    /// not ours — so the pad stays dimmed until a PAM message shows it is asking for
+    /// a finger.
+    drives_reader: bool,
     
     rx_auth: std::sync::mpsc::Receiver<AuthResult>,
     tx_auth: std::sync::mpsc::Sender<AuthResult>,
@@ -172,7 +171,6 @@ struct AuthenticatorApp {
     height: f32,
     
     simulate_mode: bool,
-    glow_timer: f32,
     
     polkit_mode: bool,
     helper_stdin: Option<std::process::ChildStdin>,
@@ -286,7 +284,6 @@ impl Application for AuthenticatorApp {
         let btn_h = cce_ui::layout::button_height();
         let verify_btn = Button::new(0.0, 0.0, 100.0, btn_h).with_label("Verify");
         let cancel_btn = Button::new(0.0, 0.0, 100.0, btn_h).with_label("Cancel");
-        let mut fingerprint_btn = Button::new(0.0, 0.0, 120.0, 120.0).with_label("Scan");
         
         let (tx_auth, rx_auth) = std::sync::mpsc::channel();
         
@@ -310,12 +307,6 @@ impl Application for AuthenticatorApp {
 
         let mut username = String::new();
         let mut cookie = String::new();
-
-        // In polkit mode the button reports the reader rather than driving it, so it
-        // should not read as something to press.
-        if polkit_mode {
-            fingerprint_btn.set_label("Reader");
-        }
 
         if let Some(ref req) = *active_req {
             if std::env::var("CCE_AUTH_SIMULATE").is_ok() {
@@ -354,7 +345,6 @@ impl Application for AuthenticatorApp {
             password_box: ui_context.insert(password_box),
             verify_btn: ui_context.insert(verify_btn),
             cancel_btn: ui_context.insert(cancel_btn),
-            fingerprint_btn: ui_context.insert(fingerprint_btn),
             
             status_msg,
             status_is_error: false,
@@ -367,7 +357,7 @@ impl Application for AuthenticatorApp {
             },
             fingerprint_active: false,
             fingerprint_success: false,
-            fingerprint_interactive: !polkit_mode,
+            drives_reader: !polkit_mode,
             
             rx_auth,
             tx_auth,
@@ -376,7 +366,6 @@ impl Application for AuthenticatorApp {
             height: 600.0,
             
             simulate_mode,
-            glow_timer: 0.0,
             
             polkit_mode,
             helper_stdin,
@@ -391,10 +380,14 @@ impl Application for AuthenticatorApp {
             ui_context,
         };
         
+        // The caret is in the box from the start: typing is the one thing every prompt
+        // can take, and the reader needs no focus — it scans whatever has the keyboard.
+        app.focus_password();
+
         let tx = app.tx_auth.clone();
         if app.simulate_mode {
-            app.status_msg = "SIMULATION MODE: use password 'password' or click fingerprint".to_string();
-            app.fingerprint_msg = "Click fingerprint sensor to scan".to_string();
+            app.status_msg = "SIMULATION MODE: use password 'password'".to_string();
+            app.fingerprint_msg = "Simulated reader".to_string();
             let tx_clone = tx.clone();
             tokio::spawn(async move {
                 tokio::time::sleep(std::time::Duration::from_secs(2)).await;
@@ -409,8 +402,6 @@ impl Application for AuthenticatorApp {
             tokio::spawn(async move {
                 if let Err(e) = run_dbus_fingerprint(username, tx.clone()).await {
                     let _ = tx.send(AuthResult::FingerprintStatus(format!("No reader: {}", e)));
-                    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
-                    let _ = tx.send(AuthResult::FingerprintStatus("Simulation mode active. Click icon to verify.".to_string()));
                 }
             });
         } else {
@@ -425,13 +416,13 @@ impl Application for AuthenticatorApp {
         WindowSettings {
             title: "CCE Authenticator".to_string(),
             app_id: "cce-authenticator".to_string(),
-            width: 640,
-            // Sized to the content now that there is no inset card: title band,
-            // two column wells, status shelf. At 400 the wells ran ~70px past
-            // anything in them and the dialog read as half empty.
-            height: 360,
+            // Sized to the content: title band, two column wells, status shelf.
+            // The password column sets the floor (label, entry, the two actions);
+            // the reader pad is small enough to sit inside whatever that leaves.
+            width: 520,
+            height: 300,
             fullscreen: false,
-            min_size: Some((560, 340)),
+            min_size: Some((460, 280)),
         }
     }
 
@@ -520,35 +511,6 @@ impl Application for AuthenticatorApp {
                     });
                 }
             }
-            AppMessage::FingerprintScanStart => {
-                if self.fingerprint_success || self.status_is_success { return; }
-                if self.polkit_mode {
-                    // PAM fprintd handles the hardware reader natively in Polkit mode
-                    return;
-                }
-                self.fingerprint_active = true;
-                self.fingerprint_msg = "Place finger on reader...".to_string();
-                
-                let tx = self.tx_auth.clone();
-                let simulate = self.simulate_mode;
-                
-                tokio::spawn(async move {
-                    if simulate {
-                        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
-                        let _ = tx.send(AuthResult::Success);
-                    } else {
-                        let Some(username) = current_username() else {
-                            let _ = tx.send(AuthResult::FingerprintStatus(
-                                "Cannot determine the current user".to_string(),
-                            ));
-                            return;
-                        };
-                        if let Err(e) = run_dbus_fingerprint(username, tx.clone()).await {
-                            let _ = tx.send(AuthResult::FingerprintStatus(format!("Scan error: {}", e)));
-                        }
-                    }
-                });
-            }
             AppMessage::Cancel => {
                 self.abandon_helper();
                 self.pending_password = None;
@@ -558,6 +520,9 @@ impl Application for AuthenticatorApp {
             AppMessage::PromptReceived(prompt, echo) => {
                 self.ui_context[self.password_box].set_label(&prompt);
                 self.clear_password();
+                // A Verify click took the caret out of the box; the next prompt (a
+                // retry's) puts it back.
+                self.focus_password();
                 self.prompted = true;
                 // The helper is past pam_fprintd, so the reader can go back to fprintd
                 // for whoever asks next.
@@ -699,14 +664,9 @@ impl Application for AuthenticatorApp {
         Some(std::time::Duration::from_millis(50))
     }
 
-    fn tick(&mut self, dt: f32, needs_rebuild: &mut bool) {
+    fn tick(&mut self, _dt: f32, _needs_rebuild: &mut bool) {
         while let Ok(res) = self.rx_auth.try_recv() {
             let _ = self.sender.send(AppMessage::AuthDone(res));
-        }
-        
-        if self.fingerprint_active {
-            self.glow_timer += dt * 4.0;
-            *needs_rebuild = true;
         }
     }
 
@@ -794,8 +754,9 @@ impl Application for AuthenticatorApp {
         let cap_h = 34.0f32; // two lines at 9pt, the longest PAM/fprintd captions
         // TODO(style): 78 is the vertical room the caption block reserves under
         // the reader (gap + cap_h + slack), pinned as one number when the reader
-        // was sized; a size, not a rung.
-        let fp_btn_w = 150.0f32.min(col_w - inset * 2.0).min(well_h - 78.0).max(64.0);
+        // was sized; a size, not a rung. 64 is the pad itself: a glyph's worth.
+        // At 150 a status indicator was the largest thing in the dialog.
+        let fp_btn_w = 64.0f32.min(col_w - inset * 2.0).min(well_h - 78.0).max(48.0);
         let fp_btn_h = fp_btn_w;
         let fp_btn_x = fp_col_x + (col_w - fp_btn_w) / 2.0;
         // Target + caption ride as one block centered in the well. Top-anchored, the
@@ -803,25 +764,42 @@ impl Application for AuthenticatorApp {
         // unfinished rather than as a target with room around it.
         let fp_block_h = fp_btn_h + gap + cap_h;
         let fp_btn_y = well_y + ((well_h - fp_block_h) / 2.0).max(inset);
-        self.ui_context[self.fingerprint_btn].set_rect(fp_btn_x, fp_btn_y, fp_btn_w, fp_btn_h);
-
-        // The reader's state color rides on the widget so the plate path paints it.
-        // It used to be a quad drawn UNDER the widget loop's `quad(w.rect(), w.color())`
-        // on the identical rect — so every state (the success accent, the scanning
-        // glow, the dimmed-inert fill) was overpainted by the button's flat default
-        // and none of them ever reached the screen.
-        self.ui_context[self.fingerprint_btn].bg = Some(if self.fingerprint_success {
+        // The reader pad is painted, not a widget: it is a status indicator, never
+        // a control — fprintd or pam_fprintd scans whether or not anything here has
+        // focus — so it is no Tab stop and takes no click. It was a Button, which
+        // put it in the Tab walk and, clicked, took the caret out of the password box.
+        let fp_rect = Rect { x: fp_btn_x, y: fp_btn_y, width: fp_btn_w, height: fp_btn_h };
+        let fp_r = cce_ui::layout::plate_corner_radius();
+        let fp_fill = if self.fingerprint_success {
             ACCENT
         } else if self.fingerprint_active {
-            let alpha = 0.4 + 0.3 * self.glow_timer.sin();
-            [0.16, 0.41, 0.18, alpha]
-        } else if self.fingerprint_interactive {
+            // Steady, not pulsing: the pad says the reader is listening, and the
+            // caption under it says what for. The old glow and sweeping scan line
+            // redrew the window every frame for as long as a prompt waited.
+            [0.16, 0.41, 0.18, 0.7]
+        } else if self.drives_reader {
             TOGGLE_OFF
         } else {
-            // PAM owns the reader here, and the click handler drops presses on the
-            // floor — so don't paint this like something that responds to one.
+            // PAM owns the reader here and has not asked for a finger yet.
             TOGGLE_INERT
-        });
+        };
+        pc.rounded_rect(fp_rect, fp_r, (true, true, true, true), fp_fill);
+        pc.recess(fp_rect, (fp_r, fp_r, fp_r, fp_r), cce_ui::layout::bevel_width());
+        let glyph = fp_btn_w * 0.6;
+        let mut glyph_color = cce_ui::color::TEXT_FG;
+        if !(self.fingerprint_success || self.fingerprint_active || self.drives_reader) {
+            glyph_color[3] *= 0.45;
+        }
+        pc.icon(
+            "fingerprint",
+            Rect {
+                x: fp_btn_x + (fp_btn_w - glyph) / 2.0,
+                y: fp_btn_y + (fp_btn_h - glyph) / 2.0,
+                width: glyph,
+                height: glyph,
+            },
+            glyph_color,
+        );
 
         let pw_inner_x = pw_col_x + inset;
         let pw_inner_w = col_w - inset * 2.0;
@@ -853,17 +831,6 @@ impl Application for AuthenticatorApp {
             cce_ui::widget::painter::paint_root_into(&self.ui_context, w, &mut pc);
         }
 
-        if self.fingerprint_active {
-            // style: deliberate — the scan line's 10px stand-off inside the
-            // reader target is the glyph's own geometry, not a layout gap.
-            let scan_y = fp_btn_y + 10.0
-                + (50.0 + 50.0 * self.glow_timer.sin()).clamp(0.0, fp_btn_h - 20.0);
-            pc.quad(
-                Rect { x: fp_btn_x + 10.0, y: scan_y, width: fp_btn_w - 20.0, height: 2.0 },
-                [0.30, 0.90, 0.32, 0.8],
-            );
-        }
-
         // ── Text ──
         let caption = cce_ui::color::control_label_color_detached_u8();
         pc.text_with(
@@ -880,7 +847,7 @@ impl Application for AuthenticatorApp {
 
         let fp_msg_color = if self.fingerprint_success {
             [0xa0, 0xee, 0xa0]
-        } else if self.fingerprint_interactive || self.fingerprint_active {
+        } else if self.drives_reader || self.fingerprint_active {
             text_rgb(cce_ui::color::TEXT_FG)
         } else {
             caption
@@ -942,7 +909,6 @@ impl Application for AuthenticatorApp {
         if ctx.propagate_event(&mv, self.password_box.id()) { *needs_rebuild = true; }
         if ctx.propagate_event(&mv, self.verify_btn.id()) { *needs_rebuild = true; }
         if ctx.propagate_event(&mv, self.cancel_btn.id()) { *needs_rebuild = true; }
-        if ctx.propagate_event(&mv, self.fingerprint_btn.id()) { *needs_rebuild = true; }
     }
 
     fn handle_mouse_input(&mut self, button: MouseButton, state: ElementState, pos: LogicalPosition, needs_rebuild: &mut bool) -> Option<Self::Message> {
@@ -963,7 +929,7 @@ impl Application for AuthenticatorApp {
 
         // A button that took the click ends the dispatch: the roots after it never
         // see this press or release.
-        for root in [self.verify_btn.id(), self.cancel_btn.id(), self.fingerprint_btn.id()] {
+        for root in [self.verify_btn.id(), self.cancel_btn.id()] {
             if self.ui_context.propagate_event(&ev, root) {
                 *needs_rebuild = true;
             }
@@ -1067,6 +1033,14 @@ impl AuthenticatorApp {
         tokio::spawn(hold_reader(self.username.clone(), rx, self.sender.clone()));
     }
 
+    /// Put the caret in the password box. `focus_id`, not `set_focused_id`: a click
+    /// elsewhere unfocuses the box directly and leaves the context's record on it, so
+    /// `set_focused_id` would see nothing to do. The box only begins editing if it
+    /// is not already, so this never disturbs a caret that is there.
+    fn focus_password(&mut self) {
+        self.ui_context.focus_id(self.password_box.id());
+    }
+
     /// What the password box holds right now. While it is editing, that is its
     /// edit buffer: `text` only catches up when the box commits (a click
     /// elsewhere, focus loss), so Enter — which `handle_key_input` takes before
@@ -1101,7 +1075,6 @@ impl AuthenticatorApp {
             let msg = match ev {
                 WidgetEvent::Clicked if id == self.verify_btn.id() => AppMessage::PasswordVerify,
                 WidgetEvent::Clicked if id == self.cancel_btn.id() => AppMessage::Cancel,
-                WidgetEvent::Clicked if id == self.fingerprint_btn.id() => AppMessage::FingerprintScanStart,
                 _ => continue,
             };
             if first.is_none() {
@@ -1113,7 +1086,8 @@ impl AuthenticatorApp {
         first
     }
 
-    /// The dialog's four real controls, in paint order.
+    /// The dialog's three real controls, in paint order. The fingerprint pad is not
+    /// one: it is painted in `display_list`, so nothing can tab to, click or hover it.
     ///
     /// A full-window `ContentBg` used to lead this list. It was the flat backdrop the
     /// window plate now is, and once the widgets paint as plates it became actively
@@ -1124,7 +1098,6 @@ impl AuthenticatorApp {
             &self.ui_context[self.password_box],
             &self.ui_context[self.verify_btn],
             &self.ui_context[self.cancel_btn],
-            &self.ui_context[self.fingerprint_btn],
         ]
     }
 }
@@ -1264,15 +1237,8 @@ async fn run_dbus_fingerprint(username: String, tx: std::sync::mpsc::Sender<Auth
     ).await?;
     
     let _ = tx.send(AuthResult::FingerprintStatus("Reader claimed. Scan finger...".to_string()));
-    
-    connection.call_method(
-        Some("net.reactivated.Fprint"),
-        device_path_str,
-        Some("net.reactivated.Fprint.Device"),
-        "VerifyStart",
-        &("any",),
-    ).await?;
-    
+
+    // Subscribed before the first VerifyStart, so no status can slip past.
     let mut stream = zbus::MessageStream::for_match_rule(
         zbus::MatchRule::builder()
             .msg_type(zbus::message::Type::Signal)
@@ -1284,27 +1250,55 @@ async fn run_dbus_fingerprint(username: String, tx: std::sync::mpsc::Sender<Auth
         &connection,
         None,
     ).await?;
-    
-    while let Some(msg) = stream.next().await {
-        if let Ok(msg) = msg {
-            if let Ok((result, keep_going)) = msg.body().deserialize::<(String, bool)>() {
-                if result == "verify-match" {
+
+    // fprintd ends a verify on a non-match. With no button to press for another
+    // try (the pad is not a control), a non-match starts the next verify itself;
+    // anything else that ends one — a match, a disconnect, an error — ends the scan.
+    loop {
+        connection.call_method(
+            Some("net.reactivated.Fprint"),
+            device_path_str,
+            Some("net.reactivated.Fprint.Device"),
+            "VerifyStart",
+            &("any",),
+        ).await?;
+
+        let mut ended_with = None;
+        while let Some(msg) = stream.next().await {
+            let Ok(msg) = msg else { continue };
+            let Ok((result, done)) = msg.body().deserialize::<(String, bool)>() else { continue };
+            match result.as_str() {
+                "verify-match" => {
                     let _ = tx.send(AuthResult::Success);
-                    break;
-                } else if result == "verify-no-match" {
-                    let _ = tx.send(AuthResult::FingerprintStatus("Failed match. Try again.".to_string()));
-                } else if result == "verify-swipe-too-short" {
-                    let _ = tx.send(AuthResult::FingerprintStatus("Swipe too short. Try again.".to_string()));
-                } else {
-                    let _ = tx.send(AuthResult::FingerprintStatus(format!("Retry scan: {}", result)));
                 }
-                if !keep_going {
-                    break;
+                "verify-no-match" => {
+                    let _ = tx.send(AuthResult::FingerprintStatus("Failed match. Try again.".to_string()));
+                }
+                "verify-swipe-too-short" => {
+                    let _ = tx.send(AuthResult::FingerprintStatus("Swipe too short. Try again.".to_string()));
+                }
+                other => {
+                    let _ = tx.send(AuthResult::FingerprintStatus(format!("Retry scan: {}", other)));
                 }
             }
+            if done || result == "verify-match" {
+                ended_with = Some(result);
+                break;
+            }
+        }
+
+        let _ = connection.call_method(
+            Some("net.reactivated.Fprint"),
+            device_path_str,
+            Some("net.reactivated.Fprint.Device"),
+            "VerifyStop",
+            &(),
+        ).await;
+        if ended_with.as_deref() != Some("verify-no-match") {
+            break;
         }
     }
-    
+
     let _ = connection.call_method(
         Some("net.reactivated.Fprint"),
         device_path_str,
