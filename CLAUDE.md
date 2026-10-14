@@ -156,7 +156,5 @@ binary *and* `cce-polkit-agent.service`. Never hand-list binaries in the Makefil
 `origin` is GitHub (`https://github.com/lsgalante/cce-authenticator.git`), and a
 post-commit hook pushes each commit there. **Committing is not publishing — the push
 is**: a commit whose push failed (hook missing, network down) is on no remote at all,
-so check `git log origin/main..` after committing. `gitsite.timer` mirrors GitHub to
-`https://git.lucas.co/cce-authenticator.git` hourly; that mirror is read-only and
-nothing pins or fetches from it. `Cargo.lock` is committed here, so refresh it when
+so check `git log origin/main..` after committing. `Cargo.lock` is committed here, so refresh it when
 dependencies change.
