@@ -32,6 +32,9 @@ enum AppMessage {
     Cancel,
     PromptReceived(String, bool), // (prompt, echo)
     StatusReceived(String, bool), // (message, is_error)
+    /// The claim `hold_reader` made so a fresh helper skips the fingerprint step:
+    /// held, or why not. Either way the next helper starts now.
+    ReaderHeld(Result<(), String>),
 }
 
 struct GuiRequest {
@@ -179,6 +182,14 @@ struct AuthenticatorApp {
     username: String,
     cookie: String,
     retries_left: u32,
+    /// The running helper has asked for a password (a `PAM_PROMPT_*` line). Until
+    /// then it is still in the `polkit-1` stack's `pam_fprintd`, waiting for a finger,
+    /// and nothing written to its stdin is read until that times out (~30s).
+    prompted: bool,
+    /// A password submitted before the helper asked for one; written at its prompt.
+    pending_password: Option<String>,
+    /// Keeps `hold_reader`'s fprintd claim alive; dropping it releases the reader.
+    reader_hold: Option<oneshot::Sender<()>>,
     sender: calloop::channel::Sender<AppMessage>,
     ui_context: cce_ui::context::UiContext,
 }
@@ -373,6 +384,9 @@ impl Application for AuthenticatorApp {
             username,
             cookie,
             retries_left: RETRIES,
+            prompted: false,
+            pending_password: None,
+            reader_hold: None,
             sender: sender.clone(),
             ui_context,
         };
@@ -452,6 +466,15 @@ impl Application for AuthenticatorApp {
                 // Polkit mode answers through the helper or not at all — never through
                 // the local PAM/simulation branch, which can report success on its own.
                 if self.polkit_mode {
+                    // An empty answer is never a password here, and PAM would count it
+                    // against faillock — Enter on an untouched box must not cost an attempt.
+                    if password.is_empty() || self.pending_password.is_some() {
+                        return;
+                    }
+                    if !self.prompted && self.shared_child.is_some() {
+                        self.skip_fingerprint(password);
+                        return;
+                    }
                     match self.helper_stdin {
                         Some(ref mut stdin) => {
                             let _ = writeln!(stdin, "{}", password);
@@ -527,24 +550,44 @@ impl Application for AuthenticatorApp {
                 });
             }
             AppMessage::Cancel => {
-                if let Some(ref shared_child) = self.shared_child {
-                    if let Some(mut child) = shared_child.lock().unwrap().take() {
-                        let _ = child.kill();
-                        // `kill` only signals — Rust never reaps on drop — and taking the
-                        // child here means the reader thread won't wait() on it either, so
-                        // without this every cancelled prompt left a zombie for the life of
-                        // the session. Reaped off-thread because this daemon must never
-                        // wedge on a wait: it is the session's only polkit agent.
-                        std::thread::spawn(move || {
-                            let _ = child.wait();
-                        });
-                    }
-                }
+                self.abandon_helper();
+                self.pending_password = None;
+                self.reader_hold = None;
                 *exit = true;
             }
-            AppMessage::PromptReceived(prompt, _echo) => {
+            AppMessage::PromptReceived(prompt, echo) => {
                 self.ui_context[self.password_box].set_label(&prompt);
                 self.clear_password();
+                self.prompted = true;
+                // The helper is past pam_fprintd, so the reader can go back to fprintd
+                // for whoever asks next.
+                self.reader_hold = None;
+                if let (false, Some(password)) = (echo, self.pending_password.take()) {
+                    if let Some(ref mut stdin) = self.helper_stdin {
+                        let _ = writeln!(stdin, "{}", password);
+                        let _ = stdin.flush();
+                        self.status_msg = "Verifying password...".to_string();
+                        self.status_is_error = false;
+                    }
+                }
+            }
+            AppMessage::ReaderHeld(held) => {
+                // Cancelled (or answered) while the claim was being made.
+                if self.pending_password.is_none() {
+                    self.reader_hold = None;
+                    return;
+                }
+                if let Err(e) = held {
+                    // The password still goes in, just after pam_fprintd gives up.
+                    log::warn!("could not hold the fingerprint reader: {}", e);
+                }
+                if let Err(e) = self.start_helper() {
+                    log::error!("could not restart helper: {}", e);
+                    self.pending_password = None;
+                    self.reader_hold = None;
+                    self.status_msg = format!("Could not restart helper: {}", e);
+                    self.status_is_error = true;
+                }
             }
             AppMessage::StatusReceived(msg, is_error) => {
                 self.status_msg = msg.clone();
@@ -564,6 +607,7 @@ impl Application for AuthenticatorApp {
                 log::debug!("AppMessage::AuthDone received: {:?}", res);
                 match res {
                     AuthResult::Success => {
+                        self.reader_hold = None;
                         self.status_is_success = true;
                         self.status_is_error = false;
                         self.fingerprint_success = true;
@@ -608,6 +652,8 @@ impl Application for AuthenticatorApp {
                         if self.polkit_mode {
                             self.helper_stdin = None;
                             self.shared_child = None;
+                            self.pending_password = None;
+                            self.reader_hold = None;
                             self.clear_password();
 
                             if self.retries_left == 0 {
@@ -616,14 +662,12 @@ impl Application for AuthenticatorApp {
                                     format!("{} — press Escape to cancel", self.status_msg);
                             } else {
                                 self.retries_left -= 1;
-                                match spawn_helper(&self.username, &self.cookie, &self.sender) {
-                                    Ok((stdin, child)) => {
+                                match self.start_helper() {
+                                    Ok(()) => {
                                         log::info!(
                                             "restarted helper for another attempt ({} left after this)",
                                             self.retries_left
                                         );
-                                        self.helper_stdin = Some(stdin);
-                                        self.shared_child = Some(child);
                                     }
                                     Err(e) => {
                                         log::error!("could not restart helper: {}", e);
@@ -948,8 +992,11 @@ impl Application for AuthenticatorApp {
                 return Some(AppMessage::Cancel);
             }
             
+            // `editing`, not `focused()`: the adapter's `focused()` reads a base flag
+            // TextBox never sets (`tracks_base_focus` is false), so it was always
+            // false here and Enter fell through to the box, which only committed.
             if let Key::Named(NamedKey::Enter) = event.logical_key {
-                if self.ui_context[self.password_box].focused(&self.ui_context) {
+                if self.ui_context[self.password_box].editing {
                     return Some(AppMessage::PasswordVerify);
                 }
             }
@@ -968,6 +1015,58 @@ impl Application for AuthenticatorApp {
 }
 
 impl AuthenticatorApp {
+    /// Start a helper for this request: one PAM conversation, from the top of the
+    /// `polkit-1` stack.
+    fn start_helper(&mut self) -> std::io::Result<()> {
+        let (stdin, child) = spawn_helper(&self.username, &self.cookie, &self.sender)?;
+        self.helper_stdin = Some(stdin);
+        self.shared_child = Some(child);
+        self.prompted = false;
+        Ok(())
+    }
+
+    /// Kill the running helper without a verdict: taking the child out of the shared
+    /// slot tells its reader thread the attempt was abandoned, not failed.
+    fn abandon_helper(&mut self) {
+        self.helper_stdin = None;
+        if let Some(shared_child) = self.shared_child.take() {
+            if let Some(mut child) = shared_child.lock().unwrap().take() {
+                let _ = child.kill();
+                // `kill` only signals — Rust never reaps on drop — and taking the
+                // child here means the reader thread won't wait() on it either, so
+                // without this every cancelled prompt left a zombie for the life of
+                // the session. Reaped off-thread because this daemon must never
+                // wedge on a wait: it is the session's only polkit agent.
+                std::thread::spawn(move || {
+                    let _ = child.wait();
+                });
+            }
+        }
+    }
+
+    /// A password submitted while the helper is still in `pam_fprintd`: the user has
+    /// chosen the password, so stop waiting for a finger.
+    ///
+    /// pam_fprintd cannot be interrupted from its conversation, so the helper is
+    /// abandoned (no PAM module has seen a password yet, so this costs no attempt
+    /// and touches no faillock count) and a new one started while this agent holds
+    /// the reader. The new helper's pam_fprintd fails to claim it, steps aside as
+    /// unavailable, and the stack goes straight to the password prompt, where
+    /// `pending_password` is written.
+    fn skip_fingerprint(&mut self, password: String) {
+        log::info!("password submitted during the fingerprint step; skipping it");
+        self.pending_password = Some(password);
+        self.clear_password();
+        self.abandon_helper();
+        self.fingerprint_active = false;
+        self.fingerprint_msg = "Skipped — using password".to_string();
+        self.status_msg = "Verifying password...".to_string();
+        self.status_is_error = false;
+        let (tx, rx) = oneshot::channel();
+        self.reader_hold = Some(tx);
+        tokio::spawn(hold_reader(self.username.clone(), rx, self.sender.clone()));
+    }
+
     /// What the password box holds right now. While it is editing, that is its
     /// edit buffer: `text` only catches up when the box commits (a click
     /// elsewhere, focus loss), so Enter — which `handle_key_input` takes before
@@ -1070,6 +1169,74 @@ fn run_pam_auth(username: &str, password: &str) -> Result<(), String> {
             Ok(())
         } else {
             Err(format!("Incorrect password (PAM: {:?})", rc))
+        }
+    }
+}
+
+/// How long `hold_reader` waits for an abandoned helper's claim to clear: fprintd
+/// releases it when that client leaves the bus, asynchronously.
+const READER_CLAIM_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
+/// The longest the agent keeps the reader. It only has to outlast the next helper's
+/// pam_fprintd claim attempt; a hold that outlived its dialog would turn every later
+/// prompt's fingerprint step into a silent no-op.
+const READER_HOLD_MAX: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Claim the default fingerprint reader for `username` and keep it until `release`
+/// fires or is dropped (or `READER_HOLD_MAX`), reporting the claim as `ReaderHeld`.
+/// A held reader is what makes the next helper's pam_fprintd step aside — see
+/// `AuthenticatorApp::skip_fingerprint`.
+async fn hold_reader(
+    username: String,
+    release: oneshot::Receiver<()>,
+    sender: calloop::channel::Sender<AppMessage>,
+) {
+    match claim_reader(&username).await {
+        Ok((connection, device)) => {
+            let _ = sender.send(AppMessage::ReaderHeld(Ok(())));
+            let _ = tokio::time::timeout(READER_HOLD_MAX, release).await;
+            let _ = connection.call_method(
+                Some("net.reactivated.Fprint"),
+                device.as_str(),
+                Some("net.reactivated.Fprint.Device"),
+                "Release",
+                &(),
+            ).await;
+        }
+        Err(e) => {
+            let _ = sender.send(AppMessage::ReaderHeld(Err(e.to_string())));
+        }
+    }
+}
+
+/// `Claim` the default reader on a connection of its own (fprintd also releases a
+/// claim when its connection closes), retrying while the abandoned helper's claim
+/// is still being released.
+async fn claim_reader(
+    username: &str,
+) -> Result<(zbus::Connection, zbus::zvariant::OwnedObjectPath), Box<dyn std::error::Error + Send + Sync>> {
+    let connection = zbus::Connection::system().await?;
+    let reply = connection.call_method(
+        Some("net.reactivated.Fprint"),
+        "/net/reactivated/Fprint/Manager",
+        Some("net.reactivated.Fprint.Manager"),
+        "GetDefaultDevice",
+        &(),
+    ).await?;
+    let device: zbus::zvariant::OwnedObjectPath = reply.body().deserialize()?;
+    let deadline = std::time::Instant::now() + READER_CLAIM_WAIT;
+    loop {
+        match connection.call_method(
+            Some("net.reactivated.Fprint"),
+            device.as_str(),
+            Some("net.reactivated.Fprint.Device"),
+            "Claim",
+            &(username,),
+        ).await {
+            Ok(_) => return Ok((connection, device)),
+            Err(_) if std::time::Instant::now() < deadline => {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+            Err(e) => return Err(e.into()),
         }
     }
 }

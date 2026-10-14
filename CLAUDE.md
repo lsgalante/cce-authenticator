@@ -62,6 +62,21 @@ what `spawn_helper` and `RETRIES` exist for; the bound is not politeness, it sto
 helper that fails *instantly* — a cookie polkitd no longer recognises — from spawning
 in a tight loop.
 
+**A password submitted during the fingerprint step skips it.** `/etc/pam.d/polkit-1`
+runs `pam_fprintd` (`sufficient`) before `system-auth`, so every helper first waits up
+to ~30s for a finger, and a password written meanwhile sits unread in the pipe. Until
+the helper prints a `PAM_PROMPT_*` line (`prompted`), Verify/Enter instead keeps the
+password (`pending_password`), abandons the helper — no PAM module has seen a password,
+so it costs no `RETRIES` and no faillock count — and starts a new one while the agent
+itself **holds the fprintd claim** (`hold_reader`). The new `pam_fprintd` cannot claim
+a busy reader, steps aside as unavailable, and the stack goes straight to the password
+prompt, where the kept password is written. The claim is released at that prompt, on
+any verdict or cancel, and after `READER_HOLD_MAX` regardless: a hold that outlived its
+dialog would silently disable the next prompt's fingerprint step. If a later prompt
+never asks for a finger, check that nothing is still holding the reader. Empty
+submissions are ignored in polkit mode, so an untouched box never costs a faillock
+attempt.
+
 ## Two invariants worth stating outright
 
 **Simulation must never be reachable under a live request.** A simulated success sends
