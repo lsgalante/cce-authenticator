@@ -214,7 +214,7 @@ fn spawn_helper(
         .stderr(std::process::Stdio::inherit())
         .spawn()?;
 
-    let missing = |what| std::io::Error::new(std::io::ErrorKind::Other, what);
+    let missing = |what| std::io::Error::other(what);
     let stdin = child.stdin.take().ok_or_else(|| missing("helper stdin"))?;
     let stdout = child.stdout.take().ok_or_else(|| missing("helper stdout"))?;
 
@@ -683,8 +683,8 @@ impl Application for AuthenticatorApp {
         // class). Shaped as display-list Text prims through the engine cache, it renders.
         use cce_ui::scene::layout::Rect;
         cce_ui::scale::set_scale_factor(scale as f32);
-        let sw = size.width as f32;
-        let sh = size.height as f32;
+        let sw = size.width;
+        let sh = size.height;
         self.width = sw;
         self.height = sh;
 
@@ -1421,9 +1421,8 @@ async fn get_system_session_id() -> Result<String, Box<dyn std::error::Error + S
     ).await?.body().deserialize()?;
     
     if let Some(pos) = reply.as_str().rfind('/') {
-        let id = reply.as_str()[pos + 1..].to_string();
-        let id = if id.starts_with('_') { id[1..].to_string() } else { id };
-        return Ok(id);
+        let tail = &reply.as_str()[pos + 1..];
+        return Ok(tail.strip_prefix('_').unwrap_or(tail).to_string());
     }
     
     Err("Session ID not found".into())
@@ -1478,6 +1477,72 @@ async fn run_polkit_agent_daemon(tx_gui_req: std::sync::mpsc::Sender<GuiRequest>
     ).await;
     
     Ok(())
+}
+
+fn main() {
+    env_logger::init();
+    let args: Vec<String> = std::env::args().collect();
+    let standalone = args.contains(&"--standalone".to_string()) || args.contains(&"-s".to_string());
+    
+    // Two workers: the agent's D-Bus tasks are a handful of awaits, and a
+    // runtime sized to the CPU count (20 here) parked 20 threads all session
+    // for them.
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("tokio runtime");
+    let _guard = rt.enter();
+    
+    if standalone {
+        cce_ui::engine::run::<AuthenticatorApp>();
+    } else {
+        let (tx_gui_req, rx_gui_req) = std::sync::mpsc::channel::<GuiRequest>();
+        
+        rt.spawn(async move {
+            if let Err(e) = run_polkit_agent_daemon(tx_gui_req).await {
+                log::error!("Error starting Polkit agent: {}", e);
+                std::process::exit(1);
+            }
+        });
+        
+        while let Ok(req) = rx_gui_req.recv() {
+            log::info!("rx_gui_req received a request for user: {}, message: {}", req.username, req.message);
+            let cookie = req.cookie.clone();
+
+            // Claim the cookie before checking, so a cancel racing this point either
+            // finds it active (and delivers, or is consumed by `new()`) or lands in
+            // `cancelled` in time to be seen right here. Requests wait their turn in
+            // the channel, and polkitd may well give up on one before its turn comes.
+            COOKIES.lock().unwrap().active = Some(cookie.clone());
+            if take_cancelled(&cookie) {
+                log::info!("cookie {} was cancelled before its window opened", cookie_tag(&cookie));
+                COOKIES.lock().unwrap().active = None;
+                let _ = req.tx_result.send(Err("Authentication cancelled".to_string()));
+                continue;
+            }
+
+            *ACTIVE_REQUEST.lock().unwrap() = Some(req);
+
+            log::info!("Starting cce_ui::engine::run...");
+            cce_ui::engine::run::<AuthenticatorApp>();
+            log::info!("cce_ui::engine::run returned/exited!");
+
+            *ACTIVE_SENDER.lock().unwrap() = None;
+            {
+                let mut st = COOKIES.lock().unwrap();
+                st.active = None;
+                st.cancelled.retain(|c| c != &cookie);
+            }
+            if let Some(req) = ACTIVE_REQUEST.lock().unwrap().take() {
+                log::info!("ACTIVE_REQUEST still present, sending Cancelled to tx_result");
+                let _ = req.tx_result.send(Err("Authentication cancelled".to_string()));
+            } else {
+                log::info!("ACTIVE_REQUEST was already taken (success/done).");
+            }
+            log::info!("Waiting for next rx_gui_req...");
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1606,71 +1671,5 @@ mod tests {
         let st = COOKIES.lock().unwrap();
         assert!(st.active.is_none());
         assert!(st.cancelled.is_empty(), "cancelled cookies leaked: {:?}", st.cancelled);
-    }
-}
-
-fn main() {
-    env_logger::init();
-    let args: Vec<String> = std::env::args().collect();
-    let standalone = args.contains(&"--standalone".to_string()) || args.contains(&"-s".to_string());
-    
-    // Two workers: the agent's D-Bus tasks are a handful of awaits, and a
-    // runtime sized to the CPU count (20 here) parked 20 threads all session
-    // for them.
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_all()
-        .build()
-        .expect("tokio runtime");
-    let _guard = rt.enter();
-    
-    if standalone {
-        cce_ui::engine::run::<AuthenticatorApp>();
-    } else {
-        let (tx_gui_req, rx_gui_req) = std::sync::mpsc::channel::<GuiRequest>();
-        
-        rt.spawn(async move {
-            if let Err(e) = run_polkit_agent_daemon(tx_gui_req).await {
-                log::error!("Error starting Polkit agent: {}", e);
-                std::process::exit(1);
-            }
-        });
-        
-        while let Ok(req) = rx_gui_req.recv() {
-            log::info!("rx_gui_req received a request for user: {}, message: {}", req.username, req.message);
-            let cookie = req.cookie.clone();
-
-            // Claim the cookie before checking, so a cancel racing this point either
-            // finds it active (and delivers, or is consumed by `new()`) or lands in
-            // `cancelled` in time to be seen right here. Requests wait their turn in
-            // the channel, and polkitd may well give up on one before its turn comes.
-            COOKIES.lock().unwrap().active = Some(cookie.clone());
-            if take_cancelled(&cookie) {
-                log::info!("cookie {} was cancelled before its window opened", cookie_tag(&cookie));
-                COOKIES.lock().unwrap().active = None;
-                let _ = req.tx_result.send(Err("Authentication cancelled".to_string()));
-                continue;
-            }
-
-            *ACTIVE_REQUEST.lock().unwrap() = Some(req);
-
-            log::info!("Starting cce_ui::engine::run...");
-            cce_ui::engine::run::<AuthenticatorApp>();
-            log::info!("cce_ui::engine::run returned/exited!");
-
-            *ACTIVE_SENDER.lock().unwrap() = None;
-            {
-                let mut st = COOKIES.lock().unwrap();
-                st.active = None;
-                st.cancelled.retain(|c| c != &cookie);
-            }
-            if let Some(req) = ACTIVE_REQUEST.lock().unwrap().take() {
-                log::info!("ACTIVE_REQUEST still present, sending Cancelled to tx_result");
-                let _ = req.tx_result.send(Err("Authentication cancelled".to_string()));
-            } else {
-                log::info!("ACTIVE_REQUEST was already taken (success/done).");
-            }
-            log::info!("Waiting for next rx_gui_req...");
-        }
     }
 }
