@@ -153,8 +153,10 @@ one test covering all three, run in sequence because `COOKIES` is process-global
 `make install` → `ccebuild install --no-build cce-authenticator`, which installs the
 binary *and* `cce-polkit-agent.service`. Never hand-list binaries in the Makefile —
 `cargo metadata` already knows them. This directory is its own git repository whose
-`origin` is the local *bare* repo `~/git/cce-authenticator.git`, a real pushable
-remote: **committing is not publishing — `git push origin main` is**, after which
-`gitsite.timer` mirrors it to `https://git.lucas.co/cce-authenticator.git` (kept as the
-`published` remote; it is the old static mirror and never accepted a push).
-`Cargo.lock` is gitignored here, so it needs no refresh when dependencies change.
+`origin` is GitHub (`https://github.com/lsgalante/cce-authenticator.git`), and a
+post-commit hook pushes each commit there. **Committing is not publishing — the push
+is**: a commit whose push failed (hook missing, network down) is on no remote at all,
+so check `git log origin/main..` after committing. `gitsite.timer` mirrors GitHub to
+`https://git.lucas.co/cce-authenticator.git` hourly; that mirror is read-only and
+nothing pins or fetches from it. `Cargo.lock` is committed here, so refresh it when
+dependencies change.
